@@ -61,10 +61,10 @@ jobs:
           import importlib.metadata
           from remote_host_mcp import __version__
           from dsw_direct_mcp import __version__ as legacy_version
-          assert __version__ == "0.2.0a1"
+          assert __version__ == "0.2.0a2"
           assert legacy_version == __version__
           assert importlib.metadata.version("remote-host-mcp") == __version__
-          assert open("VERSION", encoding="utf-8").read().strip() == "0.2.0-alpha.1"
+          assert open("VERSION", encoding="utf-8").read().strip() == "0.2.0-alpha.2"
           assert callable(importlib.import_module("remote_host_mcp.main").main)
           assert callable(importlib.import_module("remote_host_mcp.app").build_server)
           assert callable(importlib.import_module("remote_host_mcp.host_server").main)
@@ -72,6 +72,7 @@ jobs:
           assert callable(importlib.import_module("dsw_direct_mcp.job_worker").main)
           PY
           command -v remote-host-mcp >/dev/null
+          command -v remote-host-mcp-doctor >/dev/null
           command -v dsw-direct-mcp >/dev/null
 
       - name: Verify RHMCP environment compatibility
@@ -136,7 +137,7 @@ jobs:
           data=json.load(open(sys.argv[1], encoding="utf-8"))
           assert data["ok"] is True
           assert data["service"] == "Remote Host MCP"
-          assert data["version"] == "0.2.0a1"
+          assert data["version"] == "0.2.0a2"
           PY
 
           cat > "$RUNNER_TEMP/inspector.json" <<'JSON'
@@ -163,7 +164,7 @@ jobs:
           assert structured.get("hostname")
           info=(result.get("_meta") or {}).get("io.modelcontextprotocol/serverInfo") or {}
           assert info.get("name") == "Remote Host MCP"
-          assert info.get("version") == "0.2.0a1"
+          assert info.get("version") == "0.2.0a2"
           PY
 
           npx -y @modelcontextprotocol/inspector@2.6.0 --cli --config "$RUNNER_TEMP/inspector.json" --server rhmcp --method tools/call --tool-name status --tool-args-json '{}' --format json | tee "$RUNNER_TEMP/status.json"
@@ -172,7 +173,7 @@ jobs:
           data=json.load(open(sys.argv[1], encoding="utf-8")); result=data.get("result", data)
           structured=result.get("structuredContent") or result.get("structured_content") or {}
           assert structured.get("service") == "Remote Host MCP"
-          assert structured.get("version") == "0.2.0a1"
+          assert structured.get("version") == "0.2.0a2"
           PY
 
           curl -fsS -X POST 'http://127.0.0.1:8765/mcp/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr' \

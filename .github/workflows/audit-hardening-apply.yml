@@ -1,0 +1,81 @@
+name: Audit hardening apply
+
+on:
+  push:
+    branches:
+      - hardening/audit-closure-20260913
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout hardening branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Apply one-shot audited transformation
+        run: python scripts/apply_audit_closure_20260913.py
+
+      - name: Keep this workflow until connector cleanup
+        run: git checkout HEAD -- .github/workflows/audit-hardening-apply.yml
+
+      - name: Install candidate and dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: Targeted audit closure tests
+        run: pytest -q --tb=short tests/test_audit_closure.py tests/test_process_redaction.py tests/test_process_redaction_tail.py tests/test_service_diagnostics.py
+
+      - name: Full pytest suite
+        run: pytest -q --tb=short
+
+      - name: Compile package
+        run: python -m compileall -q src tests
+
+      - name: Doctor smoke without secret disclosure
+        env:
+          RHMCP_AUTH_MODE: capability
+          RHMCP_PATH_KEY: qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq
+          RHMCP_PUBLIC_HOST: audit.example.com
+          RHMCP_ALLOWED_ROOTS: /tmp
+          RHMCP_STATE_DIR: /tmp/rhmcp-audit-state
+          RHMCP_BUILD_COMMIT: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          RHMCP_BUILD_REF: refs/heads/hardening/audit-closure-20260913
+        run: |
+          output="$(python -m remote_host_mcp.doctor)"
+          printf '%s\n' "$output" | python -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True; assert d["configuration"]["public_url"].endswith("/mcp/[REDACTED]")'
+          if printf '%s' "$output" | grep -F 'qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq' >/dev/null; then
+            echo 'doctor leaked capability key' >&2
+            exit 1
+          fi
+
+      - name: Static secret and destructive-hygiene checks
+        run: |
+          ! grep -R --line-number --exclude='*.pyc' --exclude-dir='__pycache__' -E 'pkill|killall|/proc/.*/environ' src tests
+          test "$(python - <<'PY'
+import json
+print(len(json.load(open('tests/tool_manifest.json'))))
+PY
+)" = 43
+
+      - name: Commit validated candidate to hardening branch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --check
+          git diff --cached --quiet && { echo 'No changes produced'; exit 1; }
+          git commit -m 'fix: close remaining Remote Host MCP audit findings'
+          git push origin HEAD:hardening/audit-closure-20260913

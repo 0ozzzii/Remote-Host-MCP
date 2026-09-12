@@ -1,0 +1,4 @@
+[console_scripts]
+dsw-direct-mcp = remote_host_mcp.main:main
+remote-host-mcp = remote_host_mcp.main:main
+remote-host-mcp-doctor = remote_host_mcp.doctor:main

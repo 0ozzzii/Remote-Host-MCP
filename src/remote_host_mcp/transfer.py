@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import errno
 import fcntl
 import hashlib
 import json
@@ -14,8 +15,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from .atomic_fs import rename_noreplace
 from .config import Settings
-from .filesystem import hash_file, read_file_chunk
+from .filesystem import read_file_chunk
 from .models import (
     DownloadInfoResult,
     ReadFileChunkResult,
@@ -421,7 +423,32 @@ def finish_upload(upload_id: str, settings: Settings) -> UploadFinishResult:
             if (current_identity.st_dev, current_identity.st_ino) != (staging_identity.st_dev, staging_identity.st_ino):
                 raise ValueError("Upload staging file changed during finalization")
 
-            os.replace(staging_name, target_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            if bool(meta["overwrite"]):
+                if target_stat is None:
+                    try:
+                        rename_noreplace(parent_fd, staging_name, parent_fd, target_name)
+                        replaced = False
+                    except OSError as exc:
+                        if exc.errno != errno.EEXIST:
+                            raise
+                        latest = _lstat_at(parent_fd, target_name)
+                        if latest is not None and stat.S_ISLNK(latest.st_mode):
+                            raise ValueError("Refusing to replace a symlink upload destination") from exc
+                        if latest is not None and not stat.S_ISREG(latest.st_mode):
+                            raise ValueError("Destination appeared and is not a regular file") from exc
+                        os.replace(staging_name, target_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                        replaced = True
+                else:
+                    os.replace(staging_name, target_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                    replaced = True
+            else:
+                try:
+                    rename_noreplace(parent_fd, staging_name, parent_fd, target_name)
+                    replaced = False
+                except OSError as exc:
+                    if exc.errno == errno.EEXIST:
+                        raise ValueError("Destination appeared after upload began and overwrite=false") from exc
+                    raise
             os.fsync(parent_fd)
 
         meta["status"] = "committed"
@@ -469,9 +496,18 @@ def download_info(path: str, include_sha256: bool, settings: Settings) -> Downlo
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             raise ValueError("Path is not a regular file")
+        digest: str | None = None
+        if include_sha256:
+            hasher = hashlib.sha256()
+            os.lseek(fd, 0, os.SEEK_SET)
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+            digest = hasher.hexdigest()
     finally:
         os.close(fd)
-    digest = hash_file(path, settings).digest if include_sha256 else None
     return DownloadInfoResult(
         path=str(settings.resolve_allowed_path(path)),
         size=info.st_size,
@@ -479,7 +515,6 @@ def download_info(path: str, include_sha256: bool, settings: Settings) -> Downlo
         sha256=digest,
         max_chunk_bytes=settings.max_file_chunk_bytes,
     )
-
 
 def download_chunk(path: str, offset: int, max_bytes: int, settings: Settings) -> ReadFileChunkResult:
     return read_file_chunk(path, offset, max_bytes, settings)

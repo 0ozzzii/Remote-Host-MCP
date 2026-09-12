@@ -23,17 +23,21 @@ def _label(suffix: str) -> str:
 
 
 def _raw(suffix: str, default: str | None = None) -> str | None:
-    """Read migration-compatible configuration.
-
-    Existing DSWD 2.x variables intentionally win if both namespaces are present,
-    so adding RHMCP_* to a live migration cannot silently override production.
-    Clean standalone installations should use only RHMCP_*.
-    """
-    legacy = os.getenv(f"{_LEGACY_PREFIX}{suffix}")
+    """Read migration-compatible configuration without silent conflicts."""
+    canonical_name = f"{_CANONICAL_PREFIX}{suffix}"
+    legacy_name = f"{_LEGACY_PREFIX}{suffix}"
+    canonical = os.getenv(canonical_name)
+    legacy = os.getenv(legacy_name)
+    if canonical is not None and legacy is not None and canonical != legacy:
+        raise ConfigError(
+            f"Conflicting configuration: {canonical_name} and {legacy_name} are both set differently; "
+            "remove one namespace or make the values identical"
+        )
+    if canonical is not None:
+        return canonical
     if legacy is not None:
         return legacy
-    return os.getenv(f"{_CANONICAL_PREFIX}{suffix}", default)
-
+    return default
 
 def _int(suffix: str, default: int, minimum: int, maximum: int) -> int:
     name = _label(suffix)
@@ -163,6 +167,12 @@ class Settings:
     @property
     def public_url(self) -> str:
         return f"https://{self.public_host}{self.mcp_path}"
+
+    @property
+    def redacted_public_url(self) -> str:
+        if self.auth_mode == "oauth":
+            return self.public_url
+        return f"https://{self.public_host}/mcp/[REDACTED]"
 
     @classmethod
     def from_env(cls) -> "Settings":

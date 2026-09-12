@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from typing import Annotated
+from typing import Annotated, Literal
 
 from mcp.server import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
@@ -289,7 +289,7 @@ def build_server(settings: Settings) -> MCPServer:
     )
     async def terminal_signal(
         terminal_id: Annotated[str, Field(min_length=32, max_length=32, description="PTY handle.")],
-        signal_name: Annotated[str, Field(description="INT, QUIT, TSTP, TERM, HUP, or CONT.")],
+        signal_name: Annotated[Literal["INT", "QUIT", "TSTP", "TERM", "HUP", "CONT", "SIGINT", "SIGQUIT", "SIGTSTP", "SIGTERM", "SIGHUP", "SIGCONT"], Field(description="Validated terminal signal.")],
     ) -> TerminalActionResult:
         """Deliver a terminal control signal such as Ctrl+C/SIGINT to the foreground group."""
         return await terminal_manager.signal(terminal_id, signal_name)
@@ -345,7 +345,7 @@ def build_server(settings: Settings) -> MCPServer:
     async def process_signal(
         pid: Annotated[int, Field(gt=0, description="Exact Linux PID.")],
         expected_start_ticks: Annotated[int, Field(ge=0, description="start_ticks previously returned by process_info.")],
-        signal_name: Annotated[str, Field(description="INT, HUP, TERM, KILL, STOP, or CONT.")],
+        signal_name: Annotated[Literal["INT", "HUP", "TERM", "KILL", "STOP", "CONT", "SIGINT", "SIGHUP", "SIGTERM", "SIGKILL", "SIGSTOP", "SIGCONT"], Field(description="Validated process signal.")],
     ) -> ProcessSignalResult:
         """Signal one exact process using PID+starttime and pidfd when the kernel permits it."""
         return process_signal_impl(pid, expected_start_ticks, signal_name)
@@ -368,7 +368,7 @@ def build_server(settings: Settings) -> MCPServer:
     )
     async def service_action(
         service: Annotated[str, Field(min_length=1, max_length=200, description="Exact systemd unit/service name.")],
-        action: Annotated[str, Field(description="start, stop, or restart.")],
+        action: Annotated[Literal["start", "stop", "restart"], Field(description="Validated systemd action.")],
     ) -> ServiceActionResult:
         """Run one validated systemctl action without shell expansion or fuzzy process matching."""
         return service_action_impl(service, action)

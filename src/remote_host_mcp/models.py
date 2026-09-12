@@ -27,6 +27,8 @@ class StatusResult(BaseModel):
     online: bool
     service: str
     version: str
+    build_commit: str | None = None
+    build_ref: str | None = None
     hostname: str
     pid: int
     user: str

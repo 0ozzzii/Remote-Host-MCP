@@ -39,6 +39,7 @@ _TERMINAL_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 _COMPLETING_SIGNALS = {"SIGINT", "SIGQUIT", "SIGTERM", "SIGHUP"}
 _RHMCP_OSC_PREFIX = b"\x1b]133;"
 _RHMCP_OSC_RE = re.compile(rb"\x1b\]133;([CD]);id=([a-f0-9]{24})(?:;rc=(-?\d+))?\x07")
+_RHMCP_OSC_TAIL_MAX_BYTES = 256
 
 
 def _safe_terminal_env() -> dict[str, str]:
@@ -164,6 +165,19 @@ class TerminalSession:
                     self.osc_tail = cleaned[-size:]
                     cleaned = cleaned[:-size]
                     break
+        if len(self.osc_tail) > _RHMCP_OSC_TAIL_MAX_BYTES:
+            # A malformed OSC prefix without BEL must not grow an unbounded hidden
+            # buffer. Flush it as ordinary output, retaining only a possible split
+            # prefix for the next read.
+            tail = self.osc_tail
+            keep = b""
+            max_prefix = min(len(_RHMCP_OSC_PREFIX) - 1, len(tail))
+            for size in range(max_prefix, 0, -1):
+                if tail[-size:] == _RHMCP_OSC_PREFIX[:size]:
+                    keep = tail[-size:]
+                    break
+            cleaned += tail[: len(tail) - len(keep)] if keep else tail
+            self.osc_tail = keep
         return cleaned
 
     def append_output(self, data: bytes) -> None:
@@ -206,6 +220,10 @@ class TerminalSession:
             self.osc_tail = b""
             with self.condition:
                 self.buffer.extend(tail)
+                excess = len(self.buffer) - self.max_buffer_bytes
+                if excess > 0:
+                    del self.buffer[:excess]
+                    self.buffer_start += excess
                 self.condition.notify_all()
         with self.condition:
             self.condition.notify_all()

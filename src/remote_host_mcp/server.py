@@ -38,6 +38,7 @@ from .filesystem import (
     remove_path as remove_path_impl,
     write_text_file as write_text_file_impl,
 )
+from .provenance import get_build_provenance
 from .models import (
     DownloadInfoResult,
     ExecResult,
@@ -101,10 +102,13 @@ def build_server(
             mcp_version = importlib.metadata.version("mcp")
         except importlib.metadata.PackageNotFoundError:
             mcp_version = "unknown"
+        build_commit, build_ref = get_build_provenance()
         return StatusResult(
             online=True,
             service="DSW Direct Control",
             version=__version__,
+            build_commit=build_commit,
+            build_ref=build_ref,
             hostname=socket.gethostname(),
             pid=os.getpid(),
             user=getpass.getuser(),
@@ -226,7 +230,7 @@ def build_server(
         source: Annotated[str, Field(description="Absolute source path inside allowed roots.")],
         destination: Annotated[str, Field(description="Absolute destination path inside allowed roots.")],
         recursive: Annotated[bool, Field(description="Required for directory copies.")] = False,
-        overwrite: Annotated[bool, Field(description="Allow replacing/merging an existing destination.")] = False,
+        overwrite: Annotated[bool, Field(description="Allow atomically replacing an existing destination after the complete copy is staged.")] = False,
     ) -> PathActionResult:
         """Copy a regular file or, with recursive=true, a directory tree."""
         return copy_path_impl(source, destination, recursive, overwrite, settings)
@@ -263,7 +267,7 @@ def build_server(
     async def upload_begin(
         path: Annotated[str, Field(description="Absolute final destination inside allowed roots.")],
         total_size: Annotated[int, Field(ge=0, description="Exact raw byte length of the final file.")],
-        sha256: Annotated[str, Field(min_length=64, max_length=64, description="Expected final SHA-256 hex digest.")],
+        sha256: Annotated[str, Field(min_length=64, max_length=64, pattern=r"^[A-Fa-f0-9]{64}$", description="Expected final SHA-256 hex digest.")],
         mode: Annotated[int, Field(ge=0, le=511, description="Final POSIX permission bits as integer.")] = 420,
         overwrite: Annotated[bool, Field(description="Permit replacing an existing destination only at final commit.")] = False,
     ) -> UploadBeginResult:
@@ -276,7 +280,7 @@ def build_server(
         structured_output=True,
     )
     async def upload_chunk(
-        upload_id: Annotated[str, Field(min_length=32, max_length=32, description="Upload handle returned by upload_begin.")],
+        upload_id: Annotated[str, Field(min_length=32, max_length=32, pattern=r"^[a-f0-9]{32}$", description="Upload handle returned by upload_begin.")],
         offset: Annotated[int, Field(ge=0, description="Raw byte offset. Must equal next_offset unless this is an exact retry.")],
         data_base64: Annotated[str, Field(description="Base64-encoded raw chunk. Recommended raw chunk size is 256 KiB.")],
         chunk_sha256: Annotated[str | None, Field(description="Optional SHA-256 of the decoded chunk for per-chunk verification.")] = None,
@@ -290,7 +294,7 @@ def build_server(
         structured_output=True,
     )
     async def upload_status(
-        upload_id: Annotated[str, Field(min_length=32, max_length=32, description="Upload handle.")],
+        upload_id: Annotated[str, Field(min_length=32, max_length=32, pattern=r"^[a-f0-9]{32}$", description="Upload handle.")],
     ) -> UploadStatusResult:
         """Return upload state and next byte offset."""
         return upload_status_impl(upload_id, settings)
@@ -301,18 +305,18 @@ def build_server(
         structured_output=True,
     )
     async def upload_finish(
-        upload_id: Annotated[str, Field(min_length=32, max_length=32, description="Upload handle.")],
+        upload_id: Annotated[str, Field(min_length=32, max_length=32, pattern=r"^[a-f0-9]{32}$", description="Upload handle.")],
     ) -> UploadFinishResult:
         """Verify exact size and SHA-256, fsync, then atomically replace the final path. Repeating after success is safe."""
         return finish_upload_impl(upload_id, settings)
 
     @mcp.tool(
         title="Abort resumable upload",
-        annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False),
+        annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=False),
         structured_output=True,
     )
     async def upload_abort(
-        upload_id: Annotated[str, Field(min_length=32, max_length=32, description="Upload handle.")],
+        upload_id: Annotated[str, Field(min_length=32, max_length=32, pattern=r"^[a-f0-9]{32}$", description="Upload handle.")],
     ) -> UploadStatusResult:
         """Delete the uncommitted staging file and mark the upload aborted. A committed final file is never deleted."""
         return abort_upload_impl(upload_id, settings)
@@ -367,11 +371,14 @@ def build_server(
 
     @mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
     async def health(_request: Request) -> Response:
+        build_commit, build_ref = get_build_provenance()
         return JSONResponse(
             {
                 "ok": True,
                 "service": "DSW Direct Control",
                 "version": __version__,
+                "build_commit": build_commit,
+                "build_ref": build_ref,
                 "transport": "streamable-http",
             },
             headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},

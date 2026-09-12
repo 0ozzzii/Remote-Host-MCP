@@ -1,0 +1,319 @@
+name: Remote Host MCP validation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "scripts/**"
+      - "deployments/**"
+      - "pyproject.toml"
+      - "rmcp"
+      - ".env.example"
+      - ".github/workflows/validation.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "scripts/**"
+      - "deployments/**"
+      - "pyproject.toml"
+      - "rmcp"
+      - ".env.example"
+      - ".github/workflows/validation.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.19.0"
+
+      - name: Install Remote Host MCP
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+          pip check
+
+      - name: Verify release identity and compatibility entrypoints
+        run: |
+          python - <<'PY'
+          import importlib
+          import importlib.metadata
+          from remote_host_mcp import __version__
+          from dsw_direct_mcp import __version__ as legacy_version
+
+          assert __version__ == "0.1.0a1"
+          assert legacy_version == __version__
+          assert importlib.metadata.version("remote-host-mcp") == __version__
+          assert callable(importlib.import_module("remote_host_mcp.main").main)
+          assert callable(importlib.import_module("remote_host_mcp.app").build_server)
+          assert callable(importlib.import_module("remote_host_mcp.host_server").main)
+          assert callable(importlib.import_module("dsw_direct_mcp.mature_server").main)
+          assert callable(importlib.import_module("dsw_direct_mcp.job_worker").main)
+          PY
+          command -v remote-host-mcp >/dev/null
+          command -v dsw-direct-mcp >/dev/null
+
+      - name: Verify RHMCP environment compatibility
+        env:
+          RHMCP_AUTH_MODE: capability
+          RHMCP_PATH_KEY: rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr
+          RHMCP_PUBLIC_HOST: host.example.com
+          RHMCP_ALLOWED_ROOTS: ${{ github.workspace }}
+          RHMCP_STATE_DIR: ${{ runner.temp }}/rhmcp-state
+        run: |
+          python - <<'PY'
+          import os
+          from remote_host_mcp.app import load_settings
+          settings = load_settings()
+          assert settings.path_key == os.environ["RHMCP_PATH_KEY"]
+          assert settings.public_host == "host.example.com"
+          assert os.environ["DSW_MCP_PATH_KEY"] == os.environ["RHMCP_PATH_KEY"]
+          PY
+
+      - name: Shell syntax
+        run: |
+          bash -n rmcp
+          for f in scripts/*.sh; do bash -n "$f"; done
+
+      - name: Full pytest
+        shell: bash
+        run: |
+          set -o pipefail
+          pytest -q --tb=short 2>&1 | tee pytest-final.log
+
+      - name: Compile Python
+        run: python -m compileall -q src tests
+
+      - name: Modern MCP wire, branding, Tasks and 43-tool surface
+        env:
+          RHMCP_AUTH_MODE: capability
+          RHMCP_PATH_KEY: rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr
+          RHMCP_PUBLIC_HOST: host.example.com
+          RHMCP_BIND_HOST: 127.0.0.1
+          RHMCP_PORT: "8765"
+          RHMCP_ALLOWED_ROOTS: ${{ github.workspace }}
+          RHMCP_STATE_DIR: ${{ runner.temp }}/rhmcp-wire-state
+          RHMCP_JSON_RESPONSE: "true"
+          RHMCP_STATELESS_HTTP: "true"
+          RHMCP_TASKS_EXTENSION: "true"
+          RHMCP_TERMINAL_OSC133: "true"
+        run: |
+          set -euo pipefail
+          python -m remote_host_mcp.main > "$RUNNER_TEMP/rhmcp.log" 2>&1 &
+          server_pid=$!
+          cleanup() {
+            kill "$server_pid" 2>/dev/null || true
+            wait "$server_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          ready=0
+          for _ in $(seq 1 80); do
+            if curl -fsS http://127.0.0.1:8765/health > "$RUNNER_TEMP/health.json"; then
+              ready=1
+              break
+            fi
+            sleep 0.25
+          done
+          if [ "$ready" -ne 1 ]; then
+            cat "$RUNNER_TEMP/rhmcp.log" >&2
+            exit 1
+          fi
+
+          python - "$RUNNER_TEMP/health.json" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert data["ok"] is True, data
+          assert data["service"] == "Remote Host MCP", data
+          assert data["version"] == "0.1.0a1", data
+          PY
+
+          cat > "$RUNNER_TEMP/inspector.json" <<'JSON'
+          {
+            "mcpServers": {
+              "rhmcp": {
+                "type": "http",
+                "url": "http://127.0.0.1:8765/mcp/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+                "protocolEra": "modern",
+                "modernLogLevel": "off"
+              }
+            }
+          }
+          JSON
+
+          npx -y @modelcontextprotocol/inspector@2.6.0 --cli \
+            --config "$RUNNER_TEMP/inspector.json" --server rhmcp \
+            --method tools/list --format json | tee "$RUNNER_TEMP/tools.json"
+
+          python - "$RUNNER_TEMP/tools.json" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          result = data.get("result", data)
+          tools = result.get("tools") or []
+          names = {tool.get("name") for tool in tools}
+          required = {"status", "system_info", "job_run", "job_start", "terminal_open", "process_info", "process_signal", "upload_begin", "service_action"}
+          assert len(tools) == 43, len(tools)
+          assert not (required - names), sorted(required - names)
+          visible = json.dumps(tools, ensure_ascii=False)
+          for forbidden in ("DSW Direct Control", "ModelScope DSW", "DSW_MCP_", "DSWD"):
+              assert forbidden not in visible, forbidden
+          PY
+
+          npx -y @modelcontextprotocol/inspector@2.6.0 --cli \
+            --config "$RUNNER_TEMP/inspector.json" --server rhmcp \
+            --method tools/call --tool-name system_info --tool-args-json '{}' --format json \
+            | tee "$RUNNER_TEMP/system-info.json"
+
+          python - "$RUNNER_TEMP/system-info.json" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          result = data.get("result", data)
+          structured = result.get("structuredContent") or result.get("structured_content") or {}
+          assert structured.get("hostname"), data
+          info = (result.get("_meta") or {}).get("io.modelcontextprotocol/serverInfo") or {}
+          assert info.get("name") == "Remote Host MCP", data
+          assert info.get("title") == "Remote Host MCP", data
+          assert info.get("version") == "0.1.0a1", data
+          assert "remote" in (info.get("description") or "").lower(), data
+          PY
+
+          npx -y @modelcontextprotocol/inspector@2.6.0 --cli \
+            --config "$RUNNER_TEMP/inspector.json" --server rhmcp \
+            --method tools/call --tool-name status --tool-args-json '{}' --format json \
+            | tee "$RUNNER_TEMP/status.json"
+          python - "$RUNNER_TEMP/status.json" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          result = data.get("result", data)
+          structured = result.get("structuredContent") or result.get("structured_content") or {}
+          assert structured.get("service") == "Remote Host MCP", data
+          assert structured.get("version") == "0.1.0a1", data
+          PY
+
+          curl -fsS \
+            -X POST 'http://127.0.0.1:8765/mcp/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr' \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -H 'MCP-Protocol-Version: 2026-07-28' \
+            -H 'Mcp-Method: tools/call' \
+            -H 'Mcp-Name: job_run' \
+            --data '{"jsonrpc":"2.0","id":88,"method":"tools/call","params":{"name":"job_run","arguments":{"command":"printf rhmcp-task-wire-ok","idempotency_key":"ci-rhmcp-alpha1-task"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{"extensions":{"io.modelcontextprotocol/tasks":{}}},"io.modelcontextprotocol/clientInfo":{"name":"rhmcp-ci","version":"1"}}}}' \
+            | tee "$RUNNER_TEMP/task-create.json"
+
+          task_id=$(python - "$RUNNER_TEMP/task-create.json" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          result = data["result"]
+          assert result["resultType"] == "task", data
+          assert result["status"] in {"working", "completed"}, data
+          task_id = result["taskId"]
+          assert len(task_id) == 32, data
+          print(task_id)
+          PY
+          )
+
+          completed=0
+          for _ in $(seq 1 60); do
+            TASK_ID="$task_id" python - <<'PY' > "$RUNNER_TEMP/task-get-body.json"
+          import json, os
+          print(json.dumps({
+              "jsonrpc": "2.0",
+              "id": 89,
+              "method": "tasks/get",
+              "params": {
+                  "taskId": os.environ["TASK_ID"],
+                  "_meta": {
+                      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                      "io.modelcontextprotocol/clientCapabilities": {"extensions": {"io.modelcontextprotocol/tasks": {}}},
+                      "io.modelcontextprotocol/clientInfo": {"name": "rhmcp-ci", "version": "1"}
+                  }
+              }
+          }))
+          PY
+            curl -fsS \
+              -X POST 'http://127.0.0.1:8765/mcp/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr' \
+              -H 'Content-Type: application/json' \
+              -H 'Accept: application/json, text/event-stream' \
+              -H 'MCP-Protocol-Version: 2026-07-28' \
+              -H 'Mcp-Method: tasks/get' \
+              --data-binary @"$RUNNER_TEMP/task-get-body.json" \
+              > "$RUNNER_TEMP/task-get.json"
+            status=$(python - "$RUNNER_TEMP/task-get.json" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          result = data["result"]
+          assert result["resultType"] == "complete", data
+          print(result["status"])
+          PY
+            )
+            if [ "$status" = "completed" ]; then
+              completed=1
+              break
+            fi
+            sleep 0.1
+          done
+          test "$completed" = "1"
+
+          mismatch_code=$(curl -sS -o "$RUNNER_TEMP/header-mismatch.json" -w '%{http_code}' \
+            -X POST 'http://127.0.0.1:8765/mcp/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr' \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -H 'MCP-Protocol-Version: 2026-07-28' \
+            -H 'Mcp-Method: tools/call' \
+            -H 'Mcp-Name: definitely_wrong_tool_name' \
+            --data '{"jsonrpc":"2.0","id":77,"method":"tools/call","params":{"name":"system_info","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"rhmcp-ci","version":"1"}}}}')
+          test "$mismatch_code" = "400"
+          python - "$RUNNER_TEMP/header-mismatch.json" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert data["error"]["code"] == -32020, data
+          PY
+
+      - name: Static destructive and secret hygiene
+        run: |
+          if grep -R --include='*.py' --exclude-dir='*.egg-info' -n -E 'pkill[[:space:]]+-f' src/remote_host_mcp; then
+            echo 'Forbidden fuzzy pkill -f found in Python source' >&2
+            exit 1
+          fi
+          if grep -n -E 'pkill[[:space:]]+-f' scripts/*.sh rmcp; then
+            echo 'Forbidden fuzzy pkill -f found in shell source' >&2
+            exit 1
+          fi
+          if grep -R --include='*.py' --exclude-dir='*.egg-info' -n -E 'print\(.*(DSW_MCP|RHMCP)_PATH_KEY|logger\..*command[^_a-zA-Z].*=' src/remote_host_mcp; then
+            echo 'Potential secret/plain-command logging pattern found' >&2
+            exit 1
+          fi
+          echo 'Remote Host MCP static checks passed.'
+
+      - name: Upload validation diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rhmcp-validation
+          path: |
+            pytest-final.log
+            ${{ runner.temp }}/rhmcp.log
+            ${{ runner.temp }}/health.json
+            ${{ runner.temp }}/tools.json
+            ${{ runner.temp }}/system-info.json
+            ${{ runner.temp }}/status.json
+            ${{ runner.temp }}/task-create.json
+            ${{ runner.temp }}/task-get.json
+            ${{ runner.temp }}/header-mismatch.json
+          if-no-files-found: ignore
+          retention-days: 3

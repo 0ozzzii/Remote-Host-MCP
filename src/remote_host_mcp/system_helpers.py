@@ -356,10 +356,70 @@ def _bounded(text: str, limit: int = 8192) -> str:
     return raw[:limit].decode("utf-8", errors="ignore") + "\n[truncated]"
 
 
+def _pid1_is_systemd() -> bool | None:
+    try:
+        return Path("/proc/1/comm").read_text(encoding="utf-8", errors="replace").strip() == "systemd"
+    except OSError:
+        return None
+
+
+def _systemd_manager_capability() -> tuple[bool, bool | None, bool, str | None, int | None, str]:
+    """Probe whether systemctl exists and can reach the local system manager."""
+
+    systemctl_present = shutil.which("systemctl") is not None
+    pid1_is_systemd = _pid1_is_systemd()
+    if not systemctl_present:
+        return False, pid1_is_systemd, False, "systemctl_missing", None, "systemctl is unavailable"
+
+    try:
+        proc = subprocess.run(
+            ["systemctl", "show", "--no-pager", "--property=Version", "--value"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+            env=_systemctl_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return True, pid1_is_systemd, False, "manager_probe_timeout", None, "systemd manager probe timed out"
+    except OSError as exc:
+        return (
+            True,
+            pid1_is_systemd,
+            False,
+            "manager_probe_failed",
+            None,
+            f"systemd manager probe failed: {type(exc).__name__}",
+        )
+
+    output = _bounded((proc.stderr or proc.stdout).strip())
+    if proc.returncode != 0:
+        reason = "manager_unreachable_pid1_not_systemd" if pid1_is_systemd is False else "manager_unreachable"
+        if not output:
+            output = "systemd manager is unavailable"
+        return True, pid1_is_systemd, False, reason, proc.returncode, output
+    return True, pid1_is_systemd, True, None, proc.returncode, output
+
+
 def service_status(service: str) -> ServiceStatusResult:
     name = _service_name(service)
-    if shutil.which("systemctl") is None:
-        return ServiceStatusResult(service=name, available=False, return_code=None, output="systemctl is unavailable")
+    systemctl_present, pid1_is_systemd, manager_reachable, reason, probe_code, probe_output = (
+        _systemd_manager_capability()
+    )
+    if not manager_reachable:
+        return ServiceStatusResult(
+            service=name,
+            available=systemctl_present,
+            systemctl_present=systemctl_present,
+            pid1_is_systemd=pid1_is_systemd,
+            manager_reachable=False,
+            operational=False,
+            reason=reason,
+            return_code=probe_code,
+            output=probe_output,
+        )
+
     try:
         proc = subprocess.run(
             [
@@ -382,7 +442,12 @@ def service_status(service: str) -> ServiceStatusResult:
     except (OSError, subprocess.TimeoutExpired) as exc:
         return ServiceStatusResult(
             service=name,
-            available=False,
+            available=True,
+            systemctl_present=True,
+            pid1_is_systemd=pid1_is_systemd,
+            manager_reachable=True,
+            operational=True,
+            reason=None,
             return_code=None,
             output=f"systemctl status failed: {type(exc).__name__}",
         )
@@ -395,6 +460,11 @@ def service_status(service: str) -> ServiceStatusResult:
     return ServiceStatusResult(
         service=name,
         available=True,
+        systemctl_present=True,
+        pid1_is_systemd=pid1_is_systemd,
+        manager_reachable=True,
+        operational=True,
+        reason=None,
         active_state=values.get("ActiveState"),
         sub_state=values.get("SubState"),
         unit_file_state=values.get("UnitFileState"),
@@ -408,15 +478,19 @@ def service_action(service: str, action: str) -> ServiceActionResult:
     verb = action.strip().lower()
     if verb not in {"start", "stop", "restart"}:
         raise ValueError("action must be start, stop, or restart")
-    if shutil.which("systemctl") is None:
+
+    preflight = service_status(name)
+    if not preflight.operational:
+        reason = preflight.reason or "manager_unreachable"
         return ServiceActionResult(
             success=False,
             service=name,
             action=verb,
             return_code=None,
-            output="systemctl is unavailable",
-            status=service_status(name),
+            output=f"systemd manager unavailable: {reason}",
+            status=preflight,
         )
+
     try:
         proc = subprocess.run(
             ["systemctl", "--no-pager", verb, "--", name],

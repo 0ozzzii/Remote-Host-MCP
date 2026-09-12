@@ -331,6 +331,11 @@ class ProcessSignalResult(BaseModel):
 class ServiceStatusResult(BaseModel):
     service: str
     available: bool
+    systemctl_present: bool = False
+    pid1_is_systemd: bool | None = None
+    manager_reachable: bool = False
+    operational: bool = False
+    reason: str | None = None
     active_state: str | None = None
     sub_state: str | None = None
     unit_file_state: str | None = None

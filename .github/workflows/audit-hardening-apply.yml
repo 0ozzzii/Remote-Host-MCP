@@ -24,8 +24,14 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Patch doctor adapter in one-shot transformer
+        run: python scripts/patch_audit_transformer_doctor.py
+
       - name: Apply one-shot audited transformation
         run: python scripts/apply_audit_closure_20260913.py
+
+      - name: Remove branch-only trigger
+        run: rm -f .audit-trigger
 
       - name: Keep this workflow until connector cleanup
         run: git checkout HEAD -- .github/workflows/audit-hardening-apply.yml

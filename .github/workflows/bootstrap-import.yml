@@ -1,0 +1,56 @@
+name: Bootstrap Remote Host MCP 0.1.0-alpha.1
+
+on:
+  push:
+    branches:
+      - migration/bootstrap-0.1.0-alpha.1
+    paths:
+      - ".github/workflows/bootstrap-import.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: migration/bootstrap-0.1.0-alpha.1
+          fetch-depth: 0
+
+      - name: Reconstruct and verify normalized source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat _migration/chunks/chunk-* | tr -d '\r\n' > "$RUNNER_TEMP/rhmcp.b64"
+          base64 -d "$RUNNER_TEMP/rhmcp.b64" > "$RUNNER_TEMP/rhmcp.tgz"
+          echo "2f4f854e9d97061dc5014a980c326cc98075d42bb33f7557adc6eb07ebe34d52  $RUNNER_TEMP/rhmcp.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/stage"
+          tar -xzf "$RUNNER_TEMP/rhmcp.tgz" -C "$RUNNER_TEMP/stage"
+          test "$(find "$RUNNER_TEMP/stage" -type f | wc -l)" -eq 53
+          test -f "$RUNNER_TEMP/stage/pyproject.toml"
+          test -f "$RUNNER_TEMP/stage/src/remote_host_mcp/__init__.py"
+          test -f "$RUNNER_TEMP/stage/.github/workflows/validation.yml"
+          python -m compileall -q "$RUNNER_TEMP/stage/src" "$RUNNER_TEMP/stage/tests"
+          find "$RUNNER_TEMP/stage" -type d -name __pycache__ -prune -exec rm -rf {} +
+          bash -n "$RUNNER_TEMP/stage/rmcp"
+          for f in "$RUNNER_TEMP"/stage/scripts/*.sh; do bash -n "$f"; done
+
+      - name: Commit normalized product tree to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git switch main
+          test "$(git rev-parse HEAD)" = "ac6f810b9a0e5317550cb18b224b6145bbb54fbd"
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -a "$RUNNER_TEMP/stage/." .
+          git add -A
+          git diff --cached --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "feat: bootstrap Remote Host MCP 0.1.0-alpha.1"
+          git push origin HEAD:main

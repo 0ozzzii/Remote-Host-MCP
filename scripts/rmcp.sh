@@ -1,107 +1,92 @@
 #!/usr/bin/env bash
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+resolve_root() {
+  if [[ -n "${RMCP_INSTALL_STATE:-}" && -f "$RMCP_INSTALL_STATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$RMCP_INSTALL_STATE"
+    printf '%s/current\n' "$RHMCP_CODE_BASE"
+    return
+  fi
+  cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd
+}
+ROOT="$(resolve_root)"
 export RMCP_ROOT="$ROOT"
+LIB_ROOT="$ROOT/installer"
+# shellcheck disable=SC1091
+source "$LIB_ROOT/lib/i18n.sh"
+# shellcheck disable=SC1091
+source "$LIB_ROOT/lib/common.sh"
+# shellcheck disable=SC1091
+source "$LIB_ROOT/lib/update.sh"
 # shellcheck disable=SC1091
 source "$ROOT/scripts/lib.sh"
 cd "$ROOT"
 ensure_dirs
 
+VERSION="$(tr -d '\r\n' < "$ROOT/VERSION" 2>/dev/null || printf 'unknown')"
+STATE_FILE="${RMCP_INSTALL_STATE:-}"
+if [[ -n "$STATE_FILE" && -f "$STATE_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$STATE_FILE"
+  load_locale "${RHMCP_LANGUAGE:-en_US}"
+else
+  load_locale "${RHMCP_LANGUAGE:-en_US}"
+fi
+
 case "${1:-}" in
-  --root)
-    printf '%s\n' "$ROOT"
-    exit 0
-    ;;
-  --version|-V)
-    printf '%s\n' 'Remote Host MCP 0.1.0-alpha.1'
-    exit 0
-    ;;
-  --help|-h)
-    cat <<'EOF'
-Usage:
-  rmcp              Open the interactive management menu
-  rmcp --root       Print the active Remote Host MCP project root
-  rmcp --version    Print the management CLI version
-EOF
-    exit 0
-    ;;
+  --root) printf '%s\n' "$ROOT"; exit 0 ;;
+  --version|-V) printf 'Remote Host MCP %s\n' "$VERSION"; exit 0 ;;
+  --help|-h) printf 'Usage: rmcp [--root|--version|--help]\n'; exit 0 ;;
 esac
 
-pause() {
-  printf '\n'
-  read -r -p 'Press Enter to continue...' _ || true
-}
+pause_menu() { printf '\n'; read -r -p "$(t press_enter)" _ || true; }
 
-show_status() {
-  load_env || true
-  local server='DOWN' tunnel='DOWN' public='NOT CONFIGURED'
-  local host port
-  host="$(mcp_env_value PUBLIC_HOST 2>/dev/null || printf 'not-configured')"
-  port="$(mcp_env_value PORT 2>/dev/null || printf '8765')"
-
-  pid_alive logs/server.pid && server='RUNNING'
-  pid_alive logs/tunnel.pid && tunnel='RUNNING'
-
-  if [[ "$host" != 'not-configured' && "$host" != 'mcp.invalid' ]] &&
-     curl -fsS --max-time 4 "https://${host}/health" >/dev/null 2>&1; then
-    public='OK'
+service_status() {
+  if [[ "${RHMCP_SERVICE_BACKEND:-portable}" == systemd ]] && command -v systemctl >/dev/null 2>&1; then
+    systemctl is-active remote-host-mcp.service 2>/dev/null || true
+  else
+    bash scripts/manage.sh status 2>/dev/null | head -1 || true
   fi
-
-  header 'Remote Host MCP 0.1.0-alpha.1 - Management'
-  printf 'MCP Server      : %s\n' "$server"
-  printf 'Cloudflare CFT  : %s\n' "$tunnel"
-  printf 'Public Health   : %s\n' "$public"
-  printf 'Hostname        : %s\n' "$host"
-  printf 'Local endpoint  : http://127.0.0.1:%s\n' "$port"
-  subhr
 }
 
-change_host() {
-  load_env || die 'Run bootstrap first.'
-  local current new port
-  current="$(mcp_env_value PUBLIC_HOST 2>/dev/null || printf 'mcp.invalid')"
+service_action() {
+  local action="$1"
+  if [[ "${RHMCP_SERVICE_BACKEND:-portable}" == systemd ]] && command -v systemctl >/dev/null 2>&1; then
+    systemctl "$action" remote-host-mcp.service
+  else
+    case "$action" in start|stop|restart) bash scripts/manage.sh "$action" ;; *) return 2 ;; esac
+  fi
+}
+
+show_connection() {
+  load_env || die 'Missing configuration / 缺少配置'
+  local host key auth port
+  host="$(mcp_env_value PUBLIC_HOST 2>/dev/null || true)"
+  key="$(mcp_env_value PATH_KEY 2>/dev/null || true)"
+  auth="$(mcp_env_value AUTH_MODE 2>/dev/null || printf 'capability')"
   port="$(mcp_env_value PORT 2>/dev/null || printf '8765')"
-  printf 'Current hostname: %s\n' "$current"
-  read -r -p 'New hostname (no https://, no path): ' new
-  new="${new,,}"
-  new="${new%.}"
-
-  valid_hostname "$new" || {
-    warn 'Invalid hostname. Nothing changed.'
-    return
-  }
-
-  printf '\nCloudflare must also route this hostname to http://127.0.0.1:%s\n' "$port"
-  read -r -p "Apply '$new'? [y/N]: " yn
-  [[ "$yn" =~ ^[Yy]$ ]] || {
-    info 'Cancelled.'
-    return
-  }
-
-  CFD_HOST="$new" bash scripts/setup-cft.sh --reuse-token || true
-}
-
-change_token() {
-  load_env || die 'Run bootstrap first.'
-  local host
-  host="$(mcp_env_value PUBLIC_HOST 2>/dev/null || printf 'mcp.invalid')"
-  [[ "$host" == 'mcp.invalid' ]] && host='YOUR_MCP_DOMAIN'
-  cat <<EOF
-Copy the command below, replace the token placeholder, then run it:
-
-CFD_HOST='$host' CFD_TOKEN='PASTE_TUNNEL_TOKEN_HERE' bash scripts/setup-cft.sh
-EOF
+  [[ -n "$host" && "$host" != 'mcp.invalid' ]] || { warn 'Public hostname is not configured / 尚未配置公网域名'; return 0; }
+  header "Remote Host MCP $VERSION"
+  printf 'Local / 本地       : http://127.0.0.1:%s\n' "$port"
+  printf 'Public host / 域名 : %s\n' "$host"
+  if [[ "$auth" == oauth ]]; then
+    printf 'Auth / 认证        : OAuth 2.1\n'
+    printf 'MCP URL            : https://%s/mcp\n' "$host"
+  else
+    [[ -n "$key" ]] || { warn 'Capability key is missing / 私密连接密钥缺失'; return 1; }
+    printf 'Auth / 认证        : private capability URL\n'
+    printf 'MCP Path Key       : %s\n' "$key"
+    printf 'MCP URL            : https://%s/mcp/%s\n' "$host" "$key"
+    warn 'The URL contains a credential. Treat it like a password. / 完整 URL 含访问密钥，请像密码一样保存。'
+  fi
 }
 
 rotate_key() {
-  load_env || die 'Run bootstrap first.'
-  printf 'WARNING: Rotating the MCP Path Key immediately invalidates the old MCP capability URL.\n'
-  read -r -p 'Continue? [y/N]: ' yn
-  [[ "$yn" =~ ^[Yy]$ ]] || {
-    info 'Cancelled.'
-    return
-  }
-
+  load_env || die 'Missing configuration / 缺少配置'
+  warn 'Rotating the key invalidates the current MCP URL immediately. / 重置密钥会立即使旧 URL 失效。'
+  confirm || return 0
+  local backup new
   backup="$(backup_file .env env-before-key-rotation)"
   new="$(python3 - <<'PY'
 import secrets
@@ -109,93 +94,100 @@ print(secrets.token_urlsafe(48))
 PY
 )"
   set_mcp_env_value PATH_KEY "$new"
-
-  if bash scripts/manage.sh restart >/dev/null; then
-    info "Key rotated. Backup: $backup"
-    print_final_connection
+  if service_action restart >/dev/null && bash scripts/manage.sh check >/dev/null 2>&1; then
+    ok 'Key rotated / 密钥已重置'
+    show_connection
   else
     restore_file "$backup" .env
-    bash scripts/manage.sh restart >/dev/null 2>&1 || true
-    warn 'Restart failed; previous key restored.'
+    service_action restart >/dev/null 2>&1 || true
+    warn 'Restart/health failed; previous key restored. / 验证失败，已恢复旧密钥。'
   fi
 }
 
-full_diag() {
-  load_env || true
-  local port host
-  port="$(mcp_env_value PORT 2>/dev/null || printf '8765')"
-  host="$(mcp_env_value PUBLIC_HOST 2>/dev/null || printf 'mcp.invalid')"
-  header 'Remote Host MCP 0.1.0-alpha.1 - Full diagnostics'
+check_update() {
+  local remote
+  remote="$(latest_version || true)"
+  [[ -n "$remote" ]] || { warn 'Could not query update channel / 无法查询更新通道'; return; }
+  printf 'Current / 当前: %s\nLatest / 最新: %s\n' "$VERSION" "$remote"
+  if version_is_newer "$VERSION" "$remote"; then warn "$(t update_available): $remote"; else ok "$(t update_none)"; fi
+}
 
-  step '1/5' 'MCP process'
-  if pid_alive logs/server.pid; then ok "PID $(cat logs/server.pid)"; else fail 'DOWN'; fi
-
-  step '2/5' 'Local health'
-  if curl -fsS --max-time 5 "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then ok; else fail; fi
-
-  step '3/5' 'Tunnel process'
-  if pid_alive logs/tunnel.pid; then ok "PID $(cat logs/tunnel.pid)"; else fail 'DOWN'; fi
-
-  step '4/5' 'Public hostname config'
-  if [[ "$host" != 'mcp.invalid' ]]; then ok "$host"; else fail 'not configured'; fi
-
-  step '5/5' 'Public health'
-  if [[ "$host" != 'mcp.invalid' ]] && curl -fsS --max-time 8 "https://${host}/health" >/dev/null 2>&1; then
-    ok
-  else
-    fail
+change_language() {
+  local choice lang
+  printf '1. 简体中文\n2. English\n'
+  read -r -p 'Select / 选择 [1-2]: ' choice
+  case "$choice" in 1) lang=zh_CN ;; 2) lang=en_US ;; *) return ;; esac
+  load_locale "$lang"
+  if [[ -n "$STATE_FILE" && -f "$STATE_FILE" ]]; then
+    python3 - "$STATE_FILE" "$lang" <<'PY'
+from pathlib import Path
+import re, sys
+p=Path(sys.argv[1]); lang=sys.argv[2]
+s=p.read_text()
+line=f"RHMCP_LANGUAGE={lang}"
+if re.search(r'^RHMCP_LANGUAGE=.*$', s, flags=re.M):
+    s=re.sub(r'^RHMCP_LANGUAGE=.*$', line, s, flags=re.M)
+else:
+    s += ('\n' if s and not s.endswith('\n') else '') + line + '\n'
+p.write_text(s)
+PY
   fi
-
-  subhr
-  printf 'If local health fails: bash scripts/manage.sh logs 120\n'
-  printf 'If Tunnel fails:      bash scripts/manage.sh tunnel-logs 120\n'
 }
 
 while true; do
   clear 2>/dev/null || true
-  show_status
-  cat <<'EOF'
- 1. Install / repair local MCP
- 2. Configure Cloudflare Tunnel (show setup command)
- 3. Change public hostname (reuse saved Tunnel token)
- 4. Replace Cloudflare Tunnel token (show command template)
- 5. Regenerate MCP Path Key
- 6. Show MCP Path Key and full MCP URL
- 7. Full diagnostics
- 8. Restart MCP server
- 9. Restart Cloudflare Tunnel
-10. View MCP logs
-11. View Cloudflare Tunnel logs
-12. Stop MCP server
-13. Stop Cloudflare Tunnel
-14. Repair / re-register global rmcp command
- 0. Exit
-EOF
+  header "Remote Host MCP $VERSION"
+  printf 'Status / 状态 : %s\n' "$(service_status | head -1)"
+  printf 'Root / 路径   : %s\n' "$ROOT"
+  printf 'Ingress / 接入: %s\n' "${RHMCP_INGRESS:-legacy/source}"
   subhr
-  read -r -p 'Select [0-14]: ' choice
-
+  if [[ "$RMCP_LANGUAGE" == zh_CN ]]; then
+    cat <<'MENU'
+  1. 查看连接信息
+  2. 启动服务
+  3. 停止服务
+  4. 重启服务
+  5. 重置连接密钥
+  6. 完整诊断
+  7. 查看服务日志
+  8. 检查更新
+  9. 修改语言
+  0. 退出
+MENU
+  else
+    cat <<'MENU'
+  1. Show connection information
+  2. Start service
+  3. Stop service
+  4. Restart service
+  5. Rotate connection key
+  6. Full diagnostics
+  7. View service logs
+  8. Check for updates
+  9. Change language
+  0. Exit
+MENU
+  fi
+  subhr
+  read -r -p 'Select / 选择 [0-9]: ' choice
   case "$choice" in
-    1) bash scripts/bootstrap.sh; pause ;;
-    2)
-      load_env || true
-      menu_host="$(mcp_env_value PUBLIC_HOST 2>/dev/null || printf 'YOUR_MCP_DOMAIN')"
-      [[ "$menu_host" == "mcp.invalid" ]] && menu_host="YOUR_MCP_DOMAIN"
-      print_next_cft_command "$menu_host"
-      pause
+    1) show_connection; pause_menu ;;
+    2) service_action start; pause_menu ;;
+    3) service_action stop; pause_menu ;;
+    4) service_action restart; pause_menu ;;
+    5) rotate_key; pause_menu ;;
+    6) bash scripts/manage.sh check || true; pause_menu ;;
+    7)
+      if [[ "${RHMCP_SERVICE_BACKEND:-portable}" == systemd ]] && command -v journalctl >/dev/null 2>&1; then
+        journalctl -u remote-host-mcp.service -n 120 --no-pager
+      else
+        bash scripts/manage.sh logs 120
+      fi
+      pause_menu
       ;;
-    3) change_host; pause ;;
-    4) change_token; pause ;;
-    5) rotate_key; pause ;;
-    6) print_final_connection; pause ;;
-    7) full_diag; pause ;;
-    8) bash scripts/manage.sh restart; pause ;;
-    9) bash scripts/manage.sh tunnel-restart; pause ;;
-    10) bash scripts/manage.sh logs 120; pause ;;
-    11) bash scripts/manage.sh tunnel-logs 120; pause ;;
-    12) bash scripts/manage.sh stop; pause ;;
-    13) bash scripts/manage.sh tunnel-stop; pause ;;
-    14) bash scripts/register-command.sh; pause ;;
+    8) check_update; pause_menu ;;
+    9) change_language ;;
     0) exit 0 ;;
-    *) warn 'Invalid selection.'; sleep 1 ;;
+    *) warn 'Invalid selection / 无效选项'; sleep 1 ;;
   esac
 done

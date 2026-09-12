@@ -6,7 +6,7 @@ from remote_host_mcp import __version__
 
 
 def test_runtime_version_matches_installed_distribution() -> None:
-    assert __version__ == "0.1.0a1"
+    assert __version__ == "0.2.0a1"
     assert __version__ == importlib.metadata.version("remote-host-mcp")
 
 

@@ -1,0 +1,59 @@
+name: Remote Host MCP installer validation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "installer/**"
+      - "install.sh"
+      - "scripts/rmcp.sh"
+      - "VERSION"
+      - "tests/test_installer_contract.py"
+      - ".github/workflows/installer-validation.yml"
+  pull_request:
+    paths:
+      - "installer/**"
+      - "install.sh"
+      - "scripts/rmcp.sh"
+      - "VERSION"
+      - "tests/test_installer_contract.py"
+      - ".github/workflows/installer-validation.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  installer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependency
+        run: python -m pip install -q 'pytest>=8.4,<9'
+      - name: Shell syntax
+        run: |
+          set -euo pipefail
+          bash -n install.sh
+          bash -n scripts/rmcp.sh
+          find installer -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
+      - name: Installer contract tests
+        run: python -m pytest -q tests/test_installer_contract.py
+      - name: Cloudflare parser smoke
+        run: |
+          set -euo pipefail
+          source installer/lib/cloudflare.sh
+          token='AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+          parsed=$(extract_cloudflare_token "sudo cloudflared service install ${token}")
+          test "$parsed" = "$token"
+          if extract_cloudflare_token 'sudo rm -rf /; cloudflared service install short' >/dev/null 2>&1; then
+            echo 'unsafe/invalid command unexpectedly parsed' >&2
+            exit 1
+          fi
+      - name: Version ordering smoke
+        run: |
+          source installer/lib/update.sh
+          version_is_newer 0.1.0-alpha.1 0.2.0-alpha.1

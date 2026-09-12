@@ -25,7 +25,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          echo 'chunk sha256:'
+          sha256sum _migration/chunks/chunk-*
           cat _migration/chunks/chunk-* | tr -d '\r\n' > "$RUNNER_TEMP/rhmcp.b64"
+          echo 'normalized base64 sha256:'
+          sha256sum "$RUNNER_TEMP/rhmcp.b64"
           base64 -d "$RUNNER_TEMP/rhmcp.b64" > "$RUNNER_TEMP/rhmcp.tgz"
           echo "2f4f854e9d97061dc5014a980c326cc98075d42bb33f7557adc6eb07ebe34d52  $RUNNER_TEMP/rhmcp.tgz" | sha256sum -c -
           mkdir -p "$RUNNER_TEMP/stage"

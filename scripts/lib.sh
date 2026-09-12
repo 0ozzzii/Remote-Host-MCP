@@ -15,12 +15,7 @@ C_RED='\033[31m'
 C_CYAN='\033[36m'
 
 use_color() { [[ -t 1 && "${NO_COLOR:-}" == "" ]]; }
-paint() {
-  local color="$1"
-  shift
-  if use_color; then printf '%b%s%b' "$color" "$*" "$C_RESET"; else printf '%s' "$*"; fi
-}
-
+paint() { local color="$1"; shift; if use_color; then printf '%b%s%b' "$color" "$*" "$C_RESET"; else printf '%s' "$*"; fi; }
 hr() { printf '%s\n' '============================================================'; }
 subhr() { printf '%s\n' '------------------------------------------------------------'; }
 header() { hr; printf ' %s\n' "$1"; hr; }
@@ -32,6 +27,21 @@ info() { paint "$C_CYAN" 'INFO'; printf '  %s\n' "$*"; }
 warn() { paint "$C_YELLOW" 'WARN'; printf '  %s\n' "$*"; }
 die() { paint "$C_RED" 'ERROR'; printf '  %s\n' "$*" >&2; exit 1; }
 
+project_version() {
+  if [[ -f "$RMCP_ROOT/VERSION" ]]; then tr -d '\r\n' < "$RMCP_ROOT/VERSION"; return; fi
+  if [[ -x "$RMCP_ROOT/.venv/bin/python" ]]; then
+    "$RMCP_ROOT/.venv/bin/python" - <<'PY' 2>/dev/null || printf 'unknown'
+try:
+    from remote_host_mcp import __version__
+    print(__version__)
+except Exception:
+    print('unknown')
+PY
+    return
+  fi
+  printf 'unknown'
+}
+
 ensure_dirs() {
   mkdir -p "$RMCP_LOG_DIR" "$RMCP_SECRET_DIR" "$RMCP_BACKUP_DIR" "$RMCP_RUNTIME_DIR/bin"
   chmod 700 "$RMCP_SECRET_DIR" "$RMCP_BACKUP_DIR" 2>/dev/null || true
@@ -40,7 +50,6 @@ ensure_dirs() {
 load_env() {
   [[ -f "$RMCP_ENV" ]] || return 1
   set -a
-  # shellcheck disable=SC1090
   source "$RMCP_ENV"
   set +a
 }
@@ -69,15 +78,10 @@ set_env_value() {
   mv "$tmp" "$RMCP_ENV"
 }
 
-# Canonical RHMCP_* configuration with DSW_MCP_* migration compatibility.
-# Existing legacy DSWD values win when both exist, matching the Python adapter.
 mcp_env_value() {
   local suffix="$1" legacy generic
   legacy="$(get_env_value "DSW_MCP_${suffix}" 2>/dev/null || true)"
-  if [[ -n "$legacy" ]]; then
-    printf '%s\n' "$legacy"
-    return 0
-  fi
+  if [[ -n "$legacy" ]]; then printf '%s\n' "$legacy"; return 0; fi
   generic="$(get_env_value "RHMCP_${suffix}" 2>/dev/null || true)"
   [[ -n "$generic" ]] || return 1
   printf '%s\n' "$generic"
@@ -103,33 +107,14 @@ backup_file() {
   printf '%s\n' "$dest"
 }
 
-restore_file() {
-  local backup="$1" dest="$2"
-  [[ -f "$backup" ]] || die "Backup not found: $backup"
-  cp -p "$backup" "$dest"
-  chmod 600 "$dest" 2>/dev/null || true
-}
-
-valid_hostname() {
-  local host="$1"
-  [[ "$host" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]
-}
-
-pid_alive() {
-  local file="$1"
-  [[ -f "$file" ]] &&
-    [[ "$(cat "$file" 2>/dev/null || true)" =~ ^[0-9]+$ ]] &&
-    kill -0 "$(cat "$file")" 2>/dev/null
-}
+restore_file() { local backup="$1" dest="$2"; [[ -f "$backup" ]] || die "Backup not found: $backup"; cp -p "$backup" "$dest"; chmod 600 "$dest" 2>/dev/null || true; }
+valid_hostname() { local host="$1"; [[ "$host" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; }
+pid_alive() { local file="$1"; [[ -f "$file" ]] && [[ "$(cat "$file" 2>/dev/null || true)" =~ ^[0-9]+$ ]] && kill -0 "$(cat "$file")" 2>/dev/null; }
 
 cloudflared_bin() {
-  if [[ -x "$RMCP_RUNTIME_DIR/bin/cloudflared" ]]; then
-    printf '%s\n' "$RMCP_RUNTIME_DIR/bin/cloudflared"
-  elif command -v cloudflared >/dev/null 2>&1; then
-    command -v cloudflared
-  else
-    return 1
-  fi
+  if [[ -x "$RMCP_RUNTIME_DIR/bin/cloudflared" ]]; then printf '%s\n' "$RMCP_RUNTIME_DIR/bin/cloudflared"
+  elif command -v cloudflared >/dev/null 2>&1; then command -v cloudflared
+  else return 1; fi
 }
 
 print_next_cft_command() {
@@ -156,22 +141,29 @@ EOF
 
 print_final_connection() {
   load_env || die "Missing .env"
-  local key host port
+  local key host port version
   key="$(mcp_env_value PATH_KEY 2>/dev/null || true)"
   host="$(mcp_env_value PUBLIC_HOST 2>/dev/null || true)"
   port="$(mcp_env_value PORT 2>/dev/null || printf '8765')"
-  [[ -n "$key" && -n "$host" ]] || die "Missing MCP host/key"
-  header 'Remote Host MCP 0.1.0-alpha.1 - DEPLOYMENT READY'
+  version="$(project_version)"
+  [[ -n "$host" ]] || die "Missing MCP host"
+  header "Remote Host MCP ${version} - DEPLOYMENT READY"
   printf 'Local MCP        : http://127.0.0.1:%s\n' "$port"
   printf 'Public Hostname  : %s\n' "$host"
-  printf 'MCP Path Key     : %s\n' "$key"
-  if [[ "$host" == "mcp.invalid" ]]; then
-    printf 'Full MCP URL     : NOT AVAILABLE (configure public hostname first)\n'
+  if [[ "$(mcp_env_value AUTH_MODE 2>/dev/null || printf 'capability')" == oauth ]]; then
+    printf 'Full MCP URL     : https://%s/mcp\n' "$host"
+    printf 'Authentication   : OAuth 2.1\n'
   else
-    printf 'Full MCP URL     : https://%s/mcp/%s\n' "$host" "$key"
+    [[ -n "$key" ]] || die "Missing MCP key"
+    printf 'MCP Path Key     : %s\n' "$key"
+    if [[ "$host" == "mcp.invalid" ]]; then
+      printf 'Full MCP URL     : NOT AVAILABLE (configure public hostname first)\n'
+    else
+      printf 'Full MCP URL     : https://%s/mcp/%s\n' "$host" "$key"
+    fi
+    printf 'Authentication   : capability URL (OAuth optional)\n'
   fi
-  printf 'Authentication   : capability URL (OAuth optional)\n'
   subhr
-  warn 'The full MCP URL contains a credential. Do not commit or publish it.'
+  warn 'The full MCP URL contains a credential in capability mode. Do not commit or publish it.'
   hr
 }

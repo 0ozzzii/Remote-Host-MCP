@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "remote-host-mcp"
-version = "0.1.0a1"
+version = "0.2.0a1"
 description = "General-purpose MCP server for AI-controlled remote Linux hosts and containers"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,7 +23,6 @@ dev = [
 
 [project.scripts]
 remote-host-mcp = "remote_host_mcp.main:main"
-# Compatibility entrypoint for existing DSWD deployments during migration.
 dsw-direct-mcp = "remote_host_mcp.main:main"
 
 [tool.setuptools.packages.find]

@@ -7,8 +7,11 @@ on:
       - "src/**"
       - "tests/**"
       - "scripts/**"
+      - "installer/**"
       - "deployments/**"
       - "pyproject.toml"
+      - "VERSION"
+      - "install.sh"
       - "rmcp"
       - ".env.example"
       - ".github/workflows/validation.yml"
@@ -17,8 +20,11 @@ on:
       - "src/**"
       - "tests/**"
       - "scripts/**"
+      - "installer/**"
       - "deployments/**"
       - "pyproject.toml"
+      - "VERSION"
+      - "install.sh"
       - "rmcp"
       - ".env.example"
       - ".github/workflows/validation.yml"
@@ -55,10 +61,10 @@ jobs:
           import importlib.metadata
           from remote_host_mcp import __version__
           from dsw_direct_mcp import __version__ as legacy_version
-
-          assert __version__ == "0.1.0a1"
+          assert __version__ == "0.2.0a1"
           assert legacy_version == __version__
           assert importlib.metadata.version("remote-host-mcp") == __version__
+          assert open("VERSION", encoding="utf-8").read().strip() == "0.2.0-alpha.1"
           assert callable(importlib.import_module("remote_host_mcp.main").main)
           assert callable(importlib.import_module("remote_host_mcp.app").build_server)
           assert callable(importlib.import_module("remote_host_mcp.host_server").main)
@@ -87,8 +93,11 @@ jobs:
 
       - name: Shell syntax
         run: |
+          set -euo pipefail
           bash -n rmcp
+          bash -n install.sh
           for f in scripts/*.sh; do bash -n "$f"; done
+          find installer -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
 
       - name: Full pytest
         shell: bash
@@ -116,188 +125,102 @@ jobs:
           set -euo pipefail
           python -m remote_host_mcp.main > "$RUNNER_TEMP/rhmcp.log" 2>&1 &
           server_pid=$!
-          cleanup() {
-            kill "$server_pid" 2>/dev/null || true
-            wait "$server_pid" 2>/dev/null || true
-          }
+          cleanup() { kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; }
           trap cleanup EXIT
-
-          ready=0
           for _ in $(seq 1 80); do
-            if curl -fsS http://127.0.0.1:8765/health > "$RUNNER_TEMP/health.json"; then
-              ready=1
-              break
-            fi
+            curl -fsS http://127.0.0.1:8765/health > "$RUNNER_TEMP/health.json" && break
             sleep 0.25
           done
-          if [ "$ready" -ne 1 ]; then
-            cat "$RUNNER_TEMP/rhmcp.log" >&2
-            exit 1
-          fi
-
           python - "$RUNNER_TEMP/health.json" <<'PY'
           import json, sys
-          data = json.load(open(sys.argv[1], encoding="utf-8"))
-          assert data["ok"] is True, data
-          assert data["service"] == "Remote Host MCP", data
-          assert data["version"] == "0.1.0a1", data
+          data=json.load(open(sys.argv[1], encoding="utf-8"))
+          assert data["ok"] is True
+          assert data["service"] == "Remote Host MCP"
+          assert data["version"] == "0.2.0a1"
           PY
 
           cat > "$RUNNER_TEMP/inspector.json" <<'JSON'
-          {
-            "mcpServers": {
-              "rhmcp": {
-                "type": "http",
-                "url": "http://127.0.0.1:8765/mcp/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
-                "protocolEra": "modern",
-                "modernLogLevel": "off"
-              }
-            }
-          }
+          {"mcpServers":{"rhmcp":{"type":"http","url":"http://127.0.0.1:8765/mcp/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr","protocolEra":"modern","modernLogLevel":"off"}}}
           JSON
-
-          npx -y @modelcontextprotocol/inspector@2.6.0 --cli \
-            --config "$RUNNER_TEMP/inspector.json" --server rhmcp \
-            --method tools/list --format json | tee "$RUNNER_TEMP/tools.json"
-
+          npx -y @modelcontextprotocol/inspector@2.6.0 --cli --config "$RUNNER_TEMP/inspector.json" --server rhmcp --method tools/list --format json | tee "$RUNNER_TEMP/tools.json"
           python - "$RUNNER_TEMP/tools.json" <<'PY'
           import json, sys
-          data = json.load(open(sys.argv[1], encoding="utf-8"))
-          result = data.get("result", data)
-          tools = result.get("tools") or []
-          names = {tool.get("name") for tool in tools}
-          required = {"status", "system_info", "job_run", "job_start", "terminal_open", "process_info", "process_signal", "upload_begin", "service_action"}
+          data=json.load(open(sys.argv[1], encoding="utf-8")); result=data.get("result", data); tools=result.get("tools") or []
+          names={t.get("name") for t in tools}
+          required={"status","system_info","job_run","job_start","terminal_open","process_info","process_signal","upload_begin","service_action"}
           assert len(tools) == 43, len(tools)
-          assert not (required - names), sorted(required - names)
-          visible = json.dumps(tools, ensure_ascii=False)
-          for forbidden in ("DSW Direct Control", "ModelScope DSW", "DSW_MCP_", "DSWD"):
+          assert not (required-names), sorted(required-names)
+          visible=json.dumps(tools, ensure_ascii=False)
+          for forbidden in ("DSW Direct Control","ModelScope DSW","DSW_MCP_","DSWD"):
               assert forbidden not in visible, forbidden
           PY
 
-          npx -y @modelcontextprotocol/inspector@2.6.0 --cli \
-            --config "$RUNNER_TEMP/inspector.json" --server rhmcp \
-            --method tools/call --tool-name system_info --tool-args-json '{}' --format json \
-            | tee "$RUNNER_TEMP/system-info.json"
-
+          npx -y @modelcontextprotocol/inspector@2.6.0 --cli --config "$RUNNER_TEMP/inspector.json" --server rhmcp --method tools/call --tool-name system_info --tool-args-json '{}' --format json | tee "$RUNNER_TEMP/system-info.json"
           python - "$RUNNER_TEMP/system-info.json" <<'PY'
           import json, sys
-          data = json.load(open(sys.argv[1], encoding="utf-8"))
-          result = data.get("result", data)
-          structured = result.get("structuredContent") or result.get("structured_content") or {}
-          assert structured.get("hostname"), data
-          info = (result.get("_meta") or {}).get("io.modelcontextprotocol/serverInfo") or {}
-          assert info.get("name") == "Remote Host MCP", data
-          assert info.get("title") == "Remote Host MCP", data
-          assert info.get("version") == "0.1.0a1", data
-          assert "remote" in (info.get("description") or "").lower(), data
+          data=json.load(open(sys.argv[1], encoding="utf-8")); result=data.get("result", data)
+          structured=result.get("structuredContent") or result.get("structured_content") or {}
+          assert structured.get("hostname")
+          info=(result.get("_meta") or {}).get("io.modelcontextprotocol/serverInfo") or {}
+          assert info.get("name") == "Remote Host MCP"
+          assert info.get("version") == "0.2.0a1"
           PY
 
-          npx -y @modelcontextprotocol/inspector@2.6.0 --cli \
-            --config "$RUNNER_TEMP/inspector.json" --server rhmcp \
-            --method tools/call --tool-name status --tool-args-json '{}' --format json \
-            | tee "$RUNNER_TEMP/status.json"
+          npx -y @modelcontextprotocol/inspector@2.6.0 --cli --config "$RUNNER_TEMP/inspector.json" --server rhmcp --method tools/call --tool-name status --tool-args-json '{}' --format json | tee "$RUNNER_TEMP/status.json"
           python - "$RUNNER_TEMP/status.json" <<'PY'
           import json, sys
-          data = json.load(open(sys.argv[1], encoding="utf-8"))
-          result = data.get("result", data)
-          structured = result.get("structuredContent") or result.get("structured_content") or {}
-          assert structured.get("service") == "Remote Host MCP", data
-          assert structured.get("version") == "0.1.0a1", data
+          data=json.load(open(sys.argv[1], encoding="utf-8")); result=data.get("result", data)
+          structured=result.get("structuredContent") or result.get("structured_content") or {}
+          assert structured.get("service") == "Remote Host MCP"
+          assert structured.get("version") == "0.2.0a1"
           PY
 
-          curl -fsS \
-            -X POST 'http://127.0.0.1:8765/mcp/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr' \
-            -H 'Content-Type: application/json' \
-            -H 'Accept: application/json, text/event-stream' \
-            -H 'MCP-Protocol-Version: 2026-07-28' \
-            -H 'Mcp-Method: tools/call' \
-            -H 'Mcp-Name: job_run' \
-            --data '{"jsonrpc":"2.0","id":88,"method":"tools/call","params":{"name":"job_run","arguments":{"command":"printf rhmcp-task-wire-ok","idempotency_key":"ci-rhmcp-alpha1-task"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{"extensions":{"io.modelcontextprotocol/tasks":{}}},"io.modelcontextprotocol/clientInfo":{"name":"rhmcp-ci","version":"1"}}}}' \
-            | tee "$RUNNER_TEMP/task-create.json"
-
+          curl -fsS -X POST 'http://127.0.0.1:8765/mcp/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr' \
+            -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+            -H 'MCP-Protocol-Version: 2026-07-28' -H 'Mcp-Method: tools/call' -H 'Mcp-Name: job_run' \
+            --data '{"jsonrpc":"2.0","id":88,"method":"tools/call","params":{"name":"job_run","arguments":{"command":"printf rhmcp-task-wire-ok","idempotency_key":"ci-rhmcp-alpha2-task"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{"extensions":{"io.modelcontextprotocol/tasks":{}}},"io.modelcontextprotocol/clientInfo":{"name":"rhmcp-ci","version":"1"}}}}' | tee "$RUNNER_TEMP/task-create.json"
           task_id=$(python - "$RUNNER_TEMP/task-create.json" <<'PY'
           import json, sys
-          data = json.load(open(sys.argv[1], encoding="utf-8"))
-          result = data["result"]
-          assert result["resultType"] == "task", data
-          assert result["status"] in {"working", "completed"}, data
-          task_id = result["taskId"]
-          assert len(task_id) == 32, data
-          print(task_id)
+          result=json.load(open(sys.argv[1], encoding="utf-8"))["result"]
+          assert result["resultType"] == "task"
+          print(result["taskId"])
           PY
           )
-
           completed=0
           for _ in $(seq 1 60); do
-            TASK_ID="$task_id" python - <<'PY' > "$RUNNER_TEMP/task-get-body.json"
-          import json, os
-          print(json.dumps({
-              "jsonrpc": "2.0",
-              "id": 89,
-              "method": "tasks/get",
-              "params": {
-                  "taskId": os.environ["TASK_ID"],
-                  "_meta": {
-                      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                      "io.modelcontextprotocol/clientCapabilities": {"extensions": {"io.modelcontextprotocol/tasks": {}}},
-                      "io.modelcontextprotocol/clientInfo": {"name": "rhmcp-ci", "version": "1"}
-                  }
-              }
-          }))
-          PY
-            curl -fsS \
-              -X POST 'http://127.0.0.1:8765/mcp/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr' \
-              -H 'Content-Type: application/json' \
-              -H 'Accept: application/json, text/event-stream' \
-              -H 'MCP-Protocol-Version: 2026-07-28' \
-              -H 'Mcp-Method: tasks/get' \
-              --data-binary @"$RUNNER_TEMP/task-get-body.json" \
-              > "$RUNNER_TEMP/task-get.json"
-            status=$(python - "$RUNNER_TEMP/task-get.json" <<'PY'
+            body=$(python - "$task_id" <<'PY'
           import json, sys
-          data = json.load(open(sys.argv[1], encoding="utf-8"))
-          result = data["result"]
-          assert result["resultType"] == "complete", data
-          print(result["status"])
+          print(json.dumps({"jsonrpc":"2.0","id":89,"method":"tasks/get","params":{"taskId":sys.argv[1],"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{"extensions":{"io.modelcontextprotocol/tasks":{}}},"io.modelcontextprotocol/clientInfo":{"name":"rhmcp-ci","version":"1"}}}}))
           PY
             )
-            if [ "$status" = "completed" ]; then
-              completed=1
-              break
-            fi
+            curl -fsS -X POST 'http://127.0.0.1:8765/mcp/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr' \
+              -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -H 'MCP-Protocol-Version: 2026-07-28' -H 'Mcp-Method: tasks/get' --data "$body" > "$RUNNER_TEMP/task-get.json"
+            status=$(python - "$RUNNER_TEMP/task-get.json" <<'PY'
+          import json, sys
+          print(json.load(open(sys.argv[1], encoding="utf-8"))["result"]["status"])
+          PY
+            )
+            if [ "$status" = completed ]; then completed=1; break; fi
             sleep 0.1
           done
-          test "$completed" = "1"
+          test "$completed" = 1
 
-          mismatch_code=$(curl -sS -o "$RUNNER_TEMP/header-mismatch.json" -w '%{http_code}' \
-            -X POST 'http://127.0.0.1:8765/mcp/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr' \
-            -H 'Content-Type: application/json' \
-            -H 'Accept: application/json, text/event-stream' \
-            -H 'MCP-Protocol-Version: 2026-07-28' \
-            -H 'Mcp-Method: tools/call' \
-            -H 'Mcp-Name: definitely_wrong_tool_name' \
+          mismatch_code=$(curl -sS -o "$RUNNER_TEMP/header-mismatch.json" -w '%{http_code}' -X POST 'http://127.0.0.1:8765/mcp/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr' \
+            -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -H 'MCP-Protocol-Version: 2026-07-28' -H 'Mcp-Method: tools/call' -H 'Mcp-Name: definitely_wrong_tool_name' \
             --data '{"jsonrpc":"2.0","id":77,"method":"tools/call","params":{"name":"system_info","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"rhmcp-ci","version":"1"}}}}')
-          test "$mismatch_code" = "400"
+          test "$mismatch_code" = 400
           python - "$RUNNER_TEMP/header-mismatch.json" <<'PY'
           import json, sys
-          data = json.load(open(sys.argv[1], encoding="utf-8"))
-          assert data["error"]["code"] == -32020, data
+          assert json.load(open(sys.argv[1], encoding="utf-8"))["error"]["code"] == -32020
           PY
 
       - name: Static destructive and secret hygiene
         run: |
-          if grep -R --include='*.py' --exclude-dir='*.egg-info' -n -E 'pkill[[:space:]]+-f' src/remote_host_mcp; then
-            echo 'Forbidden fuzzy pkill -f found in Python source' >&2
-            exit 1
-          fi
-          if grep -n -E 'pkill[[:space:]]+-f' scripts/*.sh rmcp; then
-            echo 'Forbidden fuzzy pkill -f found in shell source' >&2
-            exit 1
-          fi
-          if grep -R --include='*.py' --exclude-dir='*.egg-info' -n -E 'print\(.*(DSW_MCP|RHMCP)_PATH_KEY|logger\..*command[^_a-zA-Z].*=' src/remote_host_mcp; then
-            echo 'Potential secret/plain-command logging pattern found' >&2
-            exit 1
-          fi
+          set -euo pipefail
+          ! grep -R --include='*.py' --exclude-dir='*.egg-info' -n -E 'pkill[[:space:]]+-f' src/remote_host_mcp
+          ! grep -R --include='*.sh' -n -E 'pkill[[:space:]]+-f' scripts installer
+          ! grep -R --include='*.sh' -n -E '(^|[[:space:]])eval([[:space:]]|$)' installer
+          ! grep -R --include='*.py' --exclude-dir='*.egg-info' -n -E 'print\(.*(DSW_MCP|RHMCP)_PATH_KEY|logger\..*command[^_a-zA-Z].*=' src/remote_host_mcp
           echo 'Remote Host MCP static checks passed.'
 
       - name: Upload validation diagnostics

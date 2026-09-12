@@ -7,6 +7,7 @@ import signal
 import socket
 import subprocess
 from pathlib import Path
+from urllib.parse import unquote_plus, urlsplit, urlunsplit
 
 from .config import Settings
 from .models import (
@@ -29,6 +30,39 @@ _ALLOWED_SIGNALS = {
     "SIGSTOP": signal.SIGSTOP,
     "SIGCONT": signal.SIGCONT,
 }
+
+_REDACTED = "<redacted>"
+_SENSITIVE_LONG_OPTIONS = {
+    "token",
+    "password",
+    "passwd",
+    "secret",
+    "api-key",
+    "apikey",
+    "access-token",
+    "auth-token",
+    "authorization",
+    "credential",
+    "credentials",
+    "client-secret",
+    "client-password",
+    "bearer-token",
+    "refresh-token",
+    "private-key-passphrase",
+    "path-key",
+    "capability-key",
+    "tunnel-token",
+}
+_SENSITIVE_OPTION_SUFFIXES = (
+    "-token",
+    "-password",
+    "-passwd",
+    "-secret",
+    "-credential",
+    "-credentials",
+    "-api-key",
+)
+_SENSITIVE_QUERY_KEYS = _SENSITIVE_LONG_OPTIONS | {"key"}
 
 
 def _proc_stat(pid: int) -> tuple[str, int, int, int, int]:
@@ -122,13 +156,97 @@ def _readlink(path: Path) -> str | None:
         return None
 
 
+def _normalized_secret_name(value: str) -> str:
+    return unquote_plus(value).strip().lower().lstrip("-").replace("_", "-")
+
+
+def _is_sensitive_long_option(value: str) -> bool:
+    normalized = _normalized_secret_name(value)
+    return normalized in _SENSITIVE_LONG_OPTIONS or any(
+        normalized.endswith(suffix) for suffix in _SENSITIVE_OPTION_SUFFIXES
+    )
+
+
+def _is_sensitive_query_key(value: str) -> bool:
+    normalized = _normalized_secret_name(value)
+    return normalized in _SENSITIVE_QUERY_KEYS or _is_sensitive_long_option(normalized)
+
+
+def _redact_url(value: str) -> str:
+    """Redact URL userinfo and explicit credential query parameters."""
+
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return value
+    if not parsed.scheme or not parsed.netloc:
+        return value
+
+    changed = False
+    netloc = parsed.netloc
+    if "@" in netloc:
+        _userinfo, hostpart = netloc.rsplit("@", 1)
+        netloc = f"{_REDACTED}@{hostpart}"
+        changed = True
+
+    query = parsed.query
+    if query:
+        pieces: list[str] = []
+        for piece in query.split("&"):
+            if "=" not in piece:
+                pieces.append(piece)
+                continue
+            key, _current = piece.split("=", 1)
+            if _is_sensitive_query_key(key):
+                pieces.append(f"{key}={_REDACTED}")
+                changed = True
+            else:
+                pieces.append(piece)
+        query = "&".join(pieces)
+
+    if not changed:
+        return value
+    return urlunsplit((parsed.scheme, netloc, parsed.path, query, parsed.fragment))
+
+
+def _redact_argument(value: str) -> str:
+    if "=" in value:
+        prefix, remainder = value.split("=", 1)
+        if prefix.startswith("--") and _is_sensitive_long_option(prefix):
+            return f"{prefix}={_REDACTED}"
+        redacted_remainder = _redact_url(remainder)
+        if redacted_remainder != remainder:
+            return f"{prefix}={redacted_remainder}"
+    return _redact_url(value)
+
+
+def _redact_argv(argv: list[str]) -> list[str]:
+    """Return diagnostic argv with secret-bearing values removed before joining/logging."""
+
+    redacted: list[str] = []
+    index = 0
+    while index < len(argv):
+        value = argv[index]
+        if value.startswith("--") and "=" not in value and _is_sensitive_long_option(value):
+            redacted.append(value)
+            if index + 1 < len(argv):
+                redacted.append(_REDACTED)
+                index += 2
+            else:
+                index += 1
+            continue
+        redacted.append(_redact_argument(value))
+        index += 1
+    return redacted
+
+
 def _cmdline(pid: int) -> str:
     try:
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
     except OSError:
         return ""
-    parts = [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
-    text = " ".join(parts)
+    argv = [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
+    text = " ".join(_redact_argv(argv))
     encoded = text.encode("utf-8")
     if len(encoded) <= 4096:
         return text

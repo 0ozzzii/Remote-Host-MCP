@@ -1,0 +1,10 @@
+.venv/
+.env
+logs/
+secrets/
+backups/
+.runtime/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage

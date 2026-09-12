@@ -1,0 +1,124 @@
+name: Remote Host MCP repair validation
+
+on:
+  pull_request:
+    paths:
+      - "src/remote_host_mcp/system_helpers.py"
+      - "src/remote_host_mcp/models.py"
+      - "tests/test_process_redaction.py"
+      - "tests/test_process_redaction_tail.py"
+      - "tests/test_service_diagnostics.py"
+      - ".github/workflows/repair-validation.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  targeted-security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+          pip check
+      - name: Process redaction and service diagnostics targeted tests
+        run: |
+          pytest -q --tb=short \
+            tests/test_process_redaction.py \
+            tests/test_process_redaction_tail.py \
+            tests/test_service_diagnostics.py
+
+  systemd-service-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install Remote Host MCP
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+          pip check
+      - name: Detect operational systemd manager
+        id: systemd
+        shell: bash
+        run: |
+          set -euo pipefail
+          capable=false
+          if [ "$(cat /proc/1/comm 2>/dev/null || true)" = "systemd" ] \
+             && command -v systemd-run >/dev/null \
+             && command -v systemctl >/dev/null \
+             && systemctl show --no-pager --property=Version --value >/dev/null 2>&1; then
+            capable=true
+          fi
+          echo "capable=$capable" >> "$GITHUB_OUTPUT"
+          echo "systemd_capable=$capable"
+      - name: Positive service_action integration on disposable transient unit
+        if: steps.systemd.outputs.capable == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          unit="rhmcp-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.service"
+          cleanup() {
+            sudo systemctl stop "$unit" >/dev/null 2>&1 || true
+            sudo systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          sudo systemd-run --unit="$unit" --property=Description="Remote Host MCP disposable service test" /bin/sleep 300 >/dev/null
+          for _ in $(seq 1 30); do
+            if sudo systemctl is-active --quiet "$unit"; then
+              break
+            fi
+            sleep 0.2
+          done
+          sudo systemctl is-active --quiet "$unit"
+
+          python_bin="$(command -v python)"
+          sudo env PATH="$PATH" PYTHONPATH="$GITHUB_WORKSPACE/src" "$python_bin" - "$unit" <<'PY'
+          import sys
+          from remote_host_mcp.system_helpers import service_action, service_status
+
+          unit = sys.argv[1]
+          before = service_status(unit)
+          assert before.systemctl_present is True
+          assert before.manager_reachable is True
+          assert before.operational is True
+          assert before.active_state == "active", before
+
+          restarted = service_action(unit, "restart")
+          assert restarted.success is True, restarted
+          assert restarted.status.manager_reachable is True
+          assert restarted.status.operational is True
+          assert restarted.status.active_state == "active", restarted.status
+
+          stopped = service_action(unit, "stop")
+          assert stopped.success is True, stopped
+          assert stopped.status.manager_reachable is True
+          assert stopped.status.operational is True
+          assert stopped.status.active_state in {"inactive", None}, stopped.status
+          PY
+
+          if sudo systemctl is-active --quiet "$unit"; then
+            echo "Disposable unit remained active after service_action(stop)" >&2
+            exit 1
+          fi
+      - name: Record systemd integration limitation
+        if: steps.systemd.outputs.capable != 'true'
+        run: |
+          echo "SYSTEMD_POSITIVE_TEST=NOT_RUN"
+          echo "Reason: this disposable CI runner has no operational systemd manager."
+          echo "Use a dedicated systemd-capable VM/runner; do not substitute a production service."

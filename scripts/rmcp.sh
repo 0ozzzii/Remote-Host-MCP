@@ -3,6 +3,7 @@ set -euo pipefail
 
 resolve_root() {
   if [[ -n "${RMCP_INSTALL_STATE:-}" && -f "$RMCP_INSTALL_STATE" ]]; then
+    # shellcheck disable=SC1090
     source "$RMCP_INSTALL_STATE"
     printf '%s/current\n' "$RHMCP_CODE_BASE"
     return
@@ -12,9 +13,13 @@ resolve_root() {
 ROOT="$(resolve_root)"
 export RMCP_ROOT="$ROOT"
 LIB_ROOT="$ROOT/installer"
+# shellcheck disable=SC1091
 source "$LIB_ROOT/lib/i18n.sh"
+# shellcheck disable=SC1091
 source "$LIB_ROOT/lib/common.sh"
+# shellcheck disable=SC1091
 source "$LIB_ROOT/lib/update.sh"
+# shellcheck disable=SC1091
 source "$ROOT/scripts/lib.sh"
 cd "$ROOT"
 ensure_dirs
@@ -22,6 +27,7 @@ ensure_dirs
 VERSION="$(tr -d '\r\n' < "$ROOT/VERSION" 2>/dev/null || printf 'unknown')"
 STATE_FILE="${RMCP_INSTALL_STATE:-}"
 if [[ -n "$STATE_FILE" && -f "$STATE_FILE" ]]; then
+  # shellcheck disable=SC1090
   source "$STATE_FILE"
   load_locale "${RHMCP_LANGUAGE:-en_US}"
 else
@@ -53,7 +59,28 @@ service_action() {
   fi
 }
 
-show_connection() { print_final_connection; }
+show_connection() {
+  load_env || die 'Missing configuration / 缺少配置'
+  local host key auth port
+  host="$(mcp_env_value PUBLIC_HOST 2>/dev/null || true)"
+  key="$(mcp_env_value PATH_KEY 2>/dev/null || true)"
+  auth="$(mcp_env_value AUTH_MODE 2>/dev/null || printf 'capability')"
+  port="$(mcp_env_value PORT 2>/dev/null || printf '8765')"
+  [[ -n "$host" && "$host" != 'mcp.invalid' ]] || { warn 'Public hostname is not configured / 尚未配置公网域名'; return 0; }
+  header "Remote Host MCP $VERSION"
+  printf 'Local / 本地       : http://127.0.0.1:%s\n' "$port"
+  printf 'Public host / 域名 : %s\n' "$host"
+  if [[ "$auth" == oauth ]]; then
+    printf 'Auth / 认证        : OAuth 2.1\n'
+    printf 'MCP URL            : https://%s/mcp\n' "$host"
+  else
+    [[ -n "$key" ]] || { warn 'Capability key is missing / 私密连接密钥缺失'; return 1; }
+    printf 'Auth / 认证        : private capability URL\n'
+    printf 'MCP Path Key       : %s\n' "$key"
+    printf 'MCP URL            : https://%s/mcp/%s\n' "$host" "$key"
+    warn 'The URL contains a credential. Treat it like a password. / 完整 URL 含访问密钥，请像密码一样保存。'
+  fi
+}
 
 rotate_key() {
   load_env || die 'Missing configuration / 缺少配置'

@@ -1,2 +1,0 @@
-dsw_direct_mcp
-remote_host_mcp

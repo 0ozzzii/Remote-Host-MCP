@@ -1,3 +1,4 @@
+# Retry after repairing chunk-06 and restoring chunk-07.
 name: Bootstrap Remote Host MCP 0.1.0-alpha.1
 
 on:

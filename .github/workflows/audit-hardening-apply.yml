@@ -64,11 +64,8 @@ jobs:
       - name: Static secret and destructive-hygiene checks
         run: |
           ! grep -R --line-number --exclude='*.pyc' --exclude-dir='__pycache__' -E 'pkill|killall|/proc/.*/environ' src tests
-          test "$(python - <<'PY'
-import json
-print(len(json.load(open('tests/tool_manifest.json'))))
-PY
-)" = 43
+          count="$(python -c 'import json; print(len(json.load(open("tests/tool_manifest.json"))))')"
+          test "$count" = 43
 
       - name: Commit validated candidate to hardening branch
         run: |

@@ -1,8 +1,0 @@
-mcp[cli]==2.2.0
-pexpect<5,>=4.9
-pyte<1,>=0.8.2
-PyJWT[crypto]<3,>=2.10
-
-[dev]
-pytest<9,>=8.4
-pytest-asyncio<1,>=0.26

@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - migration/final-import
+    paths:
+      - ".github/workflows/final-import.yml"
   workflow_dispatch:
 
 permissions:
@@ -44,6 +46,7 @@ jobs:
           git fetch origin main
           git switch main
           test "$(git rev-parse HEAD)" = "ac6f810b9a0e5317550cb18b224b6145bbb54fbd"
+          rm -f "$RUNNER_TEMP/stage/.github/workflows/validation.yml"
           find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
           cp -a "$RUNNER_TEMP/stage/." .
           git add -A

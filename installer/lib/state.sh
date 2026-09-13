@@ -20,7 +20,10 @@ resolve_build_provenance() {
 }
 
 write_release_metadata() {
-  local release="$1" tmp="$release/.rhmcp-release.env.tmp.$$" final="$release/.rhmcp-release.env"
+  local release_dir tmp final
+  release_dir="$1"
+  tmp="$release_dir/.rhmcp-release.env.tmp.$$"
+  final="$release_dir/.rhmcp-release.env"
   umask 077
   {
     printf 'RHMCP_RELEASE_VERSION=%s\n' "$(state_escape "$RMCP_VERSION")"
@@ -56,7 +59,6 @@ write_progress_state() {
   chmod 600 "$tmp"
   mv "$tmp" "$PROGRESS_STATE"
   if [[ "$status" == COMPLETE && "$stage" == COMPLETE ]]; then
-    # Runtime secrets stay only in the protected runtime env; completion output is redacted.
     if [[ -n "${PATH_KEY:-}" ]]; then PATH_KEY='<redacted>'; fi
     unset RHMCP_VALIDATION_BEARER_TOKEN 2>/dev/null || true
   fi
@@ -64,7 +66,6 @@ write_progress_state() {
 
 load_progress_state() {
   [[ -f "$PROGRESS_STATE" ]] || return 1
-  # Installer-owned root/user metadata only.
   # shellcheck disable=SC1090
   source "$PROGRESS_STATE"
 }
@@ -154,7 +155,6 @@ write_install_state() {
 load_install_state() {
   local file="$1"
   [[ -f "$file" ]] || return 1
-  # State is installer-owned metadata, never arbitrary remote input.
   # shellcheck disable=SC1090
   source "$file"
 }

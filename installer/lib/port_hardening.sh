@@ -155,8 +155,23 @@ set -u
 interval=$(printf '%q' "$interval")
 renew_hook=$(printf '%q' "$CERTBOT_RENEW_HOOK")
 log_file=$(printf '%q' "$logfile")
+child=''
+cleanup() {
+  if [[ -n "\${child:-}" ]] && kill -0 "\$child" 2>/dev/null; then
+    kill "\$child" 2>/dev/null || true
+    wait "\$child" 2>/dev/null || true
+  fi
+  child=''
+}
+trap 'cleanup; exit 0' TERM INT HUP
 while :; do
-  sleep "\$interval" || exit 0
+  sleep "\$interval" &
+  child=\$!
+  if ! wait "\$child"; then
+    child=''
+    continue
+  fi
+  child=''
   /bin/bash "\$renew_hook" >>"\$log_file" 2>&1 || true
 done
 EOF2

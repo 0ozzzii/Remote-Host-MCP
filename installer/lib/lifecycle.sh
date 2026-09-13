@@ -7,7 +7,10 @@ managed_file_has_marker() {
 }
 
 atomic_symlink() {
-  local target="$1" link="$2" tmp="${link}.tmp.$$"
+  local target link tmp
+  target="$1"
+  link="$2"
+  tmp="${link}.tmp.$$"
   rm -f -- "$tmp"
   ln -s "$target" "$tmp"
   mv -Tf -- "$tmp" "$link"
@@ -104,7 +107,11 @@ EOF2
 }
 
 upsert_env_value() {
-  local file="$1" key="$2" value="$3" tmp="${file}.tmp.$$"
+  local file key value tmp
+  file="$1"
+  key="$2"
+  value="$3"
+  tmp="${file}.tmp.$$"
   [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || return 2
   if [[ -f "$file" ]]; then
     awk -v k="$key" -v v="$value" 'BEGIN{d=0} $0 ~ "^" k "=" {print k "=" v; d=1; next} {print} END{if(!d) print k "=" v}' "$file" > "$tmp"
@@ -116,7 +123,8 @@ upsert_env_value() {
 }
 
 restore_provenance_from_release() {
-  local meta="$CURRENT_LINK/.rhmcp-release.env" commit ref
+  local meta commit ref
+  meta="$CURRENT_LINK/.rhmcp-release.env"
   [[ -f "$meta" ]] || return 1
   # shellcheck disable=SC1090
   source "$meta"

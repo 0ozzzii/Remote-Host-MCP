@@ -95,6 +95,45 @@ jobs:
           test "$rc" = 2
           grep -q '^server { listen 80; }$' "$foreign"
 
+      - name: HTTPS port reconfiguration rolls back on failed external validation
+        run: |
+          set -euo pipefail
+          sudo env WORKSPACE="$GITHUB_WORKSPACE" bash -c '
+            set -euo pipefail
+            cd "$WORKSPACE"
+            source installer/lib/common.sh
+            source installer/lib/state.sh
+            source installer/lib/lifecycle.sh
+            source installer/lib/reverse_proxy.sh
+            source installer/lib/tls.sh
+            source installer/lib/port_hardening.sh
+            source installer/lib/configure.sh
+            tmp=$(mktemp -d)
+            trap "rm -rf \"$tmp\"" EXIT
+            CONFIG_DIR="$tmp/config"; STATE_DIR="$tmp/state"; INSTALL_STATE="$CONFIG_DIR/install-state.env"; CURRENT_LINK="$tmp/current"
+            mkdir -p "$CONFIG_DIR/letsencrypt/live/test" "$STATE_DIR" "$CURRENT_LINK/.venv/bin" "$CURRENT_LINK/installer"
+            printf "RHMCP_AUTH_MODE=capability\nRHMCP_PATH_KEY=test-key\nRHMCP_PUBLIC_HOST=example.com\nRHMCP_PORT=8765\nRHMCP_PUBLIC_HTTPS_PORT=443\nRHMCP_HTTPS_LISTEN_PORT=443\nRHMCP_CERT_NAME=test\nRHMCP_CERT_FULLCHAIN=$CONFIG_DIR/letsencrypt/live/test/fullchain.pem\nRHMCP_CERT_RENEWAL_MODE=dns-01-cloudflare\n" > "$CONFIG_DIR/rhmcp.env"
+            printf "RHMCP_INSTALL_STATUS=COMPLETE\nRHMCP_PUBLIC_HTTPS_PORT=443\nRHMCP_HTTPS_LISTEN_PORT=443\n" > "$INSTALL_STATE"
+            printf dummy > "$CONFIG_DIR/letsencrypt/live/test/fullchain.pem"
+            printf dummy > "$CONFIG_DIR/letsencrypt/live/test/privkey.pem"
+            nginx_conf="$tmp/remote-host-mcp.conf"
+            printf "# Managed-By: remote-host-mcp\nlisten-old\n" > "$nginx_conf"
+            export RHMCP_NGINX_CONFIG_PATH="$nginx_conf"
+            INGRESS=domain
+            bind_port_free_any() { :; }
+            write_managed_nginx_https() { printf "# Managed-By: remote-host-mcp\nlisten-new\n" > "$nginx_conf"; }
+            verify_external_https() { return 1; }
+            _config_protocol_gate() { return 0; }
+            reload_nginx_safely() { :; }
+            if apply_https_port_mapping 2012 8443; then exit 90; fi
+            grep -q "^RHMCP_PUBLIC_HTTPS_PORT=443$" "$CONFIG_DIR/rhmcp.env"
+            grep -q "^RHMCP_HTTPS_LISTEN_PORT=443$" "$CONFIG_DIR/rhmcp.env"
+            grep -q "^RHMCP_PUBLIC_HTTPS_PORT=443$" "$INSTALL_STATE"
+            grep -q "^RHMCP_HTTPS_LISTEN_PORT=443$" "$INSTALL_STATE"
+            grep -q "^listen-old$" "$nginx_conf"
+            test -z "$(find "$STATE_DIR" -maxdepth 1 -type f -name "configure-*" -print -quit)"
+          '
+
       - name: State write failure is explicit
         run: |
           set -euo pipefail
@@ -190,6 +229,15 @@ jobs:
           }
 
           install_once
+          server_pid=$(cat "$install_root/logs/server.pid")
+          server_rss_kib=$(ps -o rss= -p "$server_pid" | tr -d ' ')
+          venv_mib=$(du -sm "$install_root/current/.venv" | awk '{print $1}')
+          install_tree_mib=$(du -sm "$install_root" | awk '{print $1}')
+          echo "RESOURCE_SNAPSHOT server_rss_kib=${server_rss_kib} venv_mib=${venv_mib} install_tree_mib=${install_tree_mib}"
+          test "$server_rss_kib" -gt 0
+          test "$venv_mib" -gt 0
+          test "$install_tree_mib" -gt 0
+
           mark_resumable_public_ready
           rmcp resume
           assert_complete_identity

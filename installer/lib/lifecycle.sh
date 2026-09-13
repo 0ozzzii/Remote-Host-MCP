@@ -190,22 +190,105 @@ diagnose_install() {
   if wait_local_health "${RHMCP_LOCAL_PORT:-${LOCAL_PORT:-8765}}" 2 1; then printf 'Local health       : PASS\n'; else printf 'Local health       : FAIL\n'; fi
 }
 
-repair_local_lifecycle() {
+load_repair_runtime_context() {
   local env_file="$CONFIG_DIR/rhmcp.env"
+  [[ -f "$env_file" ]] || die 'Runtime environment is missing; automatic secret reconstruction is intentionally refused.'
+  set -a
+  # shellcheck disable=SC1090
+  source "$env_file"
+  set +a
+  AUTH_MODE="${RHMCP_AUTH_MODE:-${AUTH_MODE:-capability}}"
+  PATH_KEY="${RHMCP_PATH_KEY:-${PATH_KEY:-}}"
+  PUBLIC_HOST="${RHMCP_PUBLIC_HOST:-${PUBLIC_HOST:-mcp.invalid}}"
+  LOCAL_PORT="${RHMCP_PORT:-${LOCAL_PORT:-8765}}"
+  PUBLIC_HTTPS_PORT="${RHMCP_PUBLIC_HTTPS_PORT:-${PUBLIC_HTTPS_PORT:-443}}"
+  DOMAIN_DNS_MODE="${RHMCP_DOMAIN_DNS_MODE:-${DOMAIN_DNS_MODE:-unknown}}"
+  ACME_EMAIL="${RHMCP_ACME_EMAIL:-${ACME_EMAIL:-}}"
+  export AUTH_MODE PATH_KEY PUBLIC_HOST LOCAL_PORT PUBLIC_HTTPS_PORT DOMAIN_DNS_MODE ACME_EMAIL
+}
+
+repair_ingress_lifecycle() {
+  local token_file rc cert_name cert_fullchain cert_privkey cert_mode config
+  case "${INGRESS:-private}" in
+    private)
+      info 'Private/local profile: no public ingress repair required.'
+      ;;
+    cloudflare-tunnel)
+      token_file="$SECRET_DIR/cloudflared.token"
+      [[ -r "$token_file" ]] || die 'Cloudflare Tunnel credential is missing; repair will not reconstruct secrets. Restore the credential or reconfigure the tunnel.'
+      install_managed_tunnel_service "$token_file"
+      set +e; external_http_probe "https://${PUBLIC_HOST}/health" 200; rc=$?; set -e
+      [[ $rc -eq 0 ]] || { fail 'Cloudflare Tunnel repair did not pass external HTTPS validation.'; return 1; }
+      ok 'Cloudflare Tunnel repair + external HTTPS PASS'
+      ;;
+    domain|public-ip)
+      [[ $EUID -eq 0 ]] || die 'Managed direct HTTPS repair requires root/sudo.'
+      [[ -n "$ACME_EMAIL" && "$ACME_EMAIL" == *@*.* ]] || die 'Stored ACME contact email is missing or invalid; refusing certificate repair.'
+      ensure_nginx_for_direct
+      ensure_product_certbot
+      cert_name="${RHMCP_CERT_NAME:-}"
+      cert_fullchain="${RHMCP_CERT_FULLCHAIN:-}"
+      cert_mode="${RHMCP_CERT_RENEWAL_MODE:-}"
+      cert_privkey=''
+      [[ -n "$cert_name" ]] && cert_privkey="$ACME_CONFIG_DIR/live/$cert_name/privkey.pem"
+      config="$(nginx_product_config_path 2>/dev/null || true)"
+      if [[ -n "$cert_name" && -r "$cert_fullchain" && -r "$cert_privkey" ]]; then
+        CERT_NAME="$cert_name"
+        CERT_FULLCHAIN="$cert_fullchain"
+        CERT_PRIVKEY="$cert_privkey"
+        CERT_RENEWAL_MODE="$cert_mode"
+        export CERT_NAME CERT_FULLCHAIN CERT_PRIVKEY CERT_RENEWAL_MODE
+        if [[ -z "$config" ]]; then die 'No supported Nginx product config path is available for repair.'; fi
+        if [[ -e "$config" && ! managed_file_has_marker "$config" ]]; then
+          die "Foreign Nginx config occupies product path: $config"
+        fi
+        if [[ ! -e "$config" ]]; then
+          write_managed_nginx_http "$PUBLIC_HOST" "$LOCAL_PORT" "$ACME_WEBROOT"
+        fi
+        write_managed_nginx_https "$PUBLIC_HOST" "$LOCAL_PORT" "$ACME_WEBROOT" "$CERT_FULLCHAIN" "$CERT_PRIVKEY" "$PUBLIC_HTTPS_PORT"
+        renewal_dry_run_gate
+        setup_renewal_timer
+        verify_external_https "$PUBLIC_HOST" "$PUBLIC_HTTPS_PORT"
+      elif [[ "$INGRESS" == domain ]]; then
+        warn 'Stored certificate material is incomplete; re-running managed Domain HTTPS issuance using persisted non-secret settings and existing provider credential if required.'
+        configure_domain_https "$PUBLIC_HOST" "$ACME_EMAIL" "$DOMAIN_DNS_MODE" "$PUBLIC_HTTPS_PORT"
+      else
+        warn 'Stored IP certificate material is incomplete; re-running short-lived Public IP HTTPS issuance.'
+        configure_public_ip_https "$PUBLIC_HOST" "$ACME_EMAIL" "$PUBLIC_HTTPS_PORT"
+      fi
+      ok 'Managed direct HTTPS repair PASS'
+      ;;
+    *)
+      die "Unknown ingress profile in install state: ${INGRESS:-unset}"
+      ;;
+  esac
+}
+
+repair_local_lifecycle() {
+  local env_file="$CONFIG_DIR/rhmcp.env" unit='/etc/systemd/system/remote-host-mcp.service'
   [[ -d "$CURRENT_LINK" || -L "$CURRENT_LINK" ]] || die 'Current release is missing; use installer resume or reinstall.'
   [[ -f "$env_file" ]] || die 'Runtime environment is missing; automatic secret reconstruction is intentionally refused.'
+  load_repair_runtime_context
   restore_provenance_from_release || warn 'Could not repair build provenance from release metadata.'
   install_rmcp_launcher
   if [[ "$SERVICE_BACKEND" == systemd ]]; then
-    if ! managed_file_has_marker /etc/systemd/system/remote-host-mcp.service; then
-      die 'Systemd unit is missing or not product-managed; refusing to overwrite a foreign unit.'
+    if managed_file_has_marker "$unit"; then
+      systemctl daemon-reload
+      systemctl enable remote-host-mcp.service >/dev/null
+      if ! wait_local_health "$LOCAL_PORT" 2 1; then systemctl restart remote-host-mcp.service; fi
+    elif [[ ! -e "$unit" ]] && resource_owned service_unit; then
+      install_managed_systemd_service || die 'Could not recreate the previously owned systemd service.'
+    else
+      die 'Systemd unit is missing without ownership evidence or is not product-managed; refusing to overwrite a foreign unit.'
     fi
-    systemctl daemon-reload
-    systemctl enable remote-host-mcp.service >/dev/null
-    if ! wait_local_health "$LOCAL_PORT" 2 1; then systemctl restart remote-host-mcp.service; fi
   else
     if ! wait_local_health "$LOCAL_PORT" 2 1; then start_portable_service_managed; fi
   fi
   if ! wait_local_health "$LOCAL_PORT" 30 1; then service_readiness_diagnostics "$LOCAL_PORT"; return 1; fi
   ok 'Local lifecycle repair PASS / 本地生命周期修复通过'
+  repair_ingress_lifecycle
+  if declare -F mcp_final_validation >/dev/null 2>&1; then
+    mcp_final_validation
+    ok 'MCP protocol repair gate PASS'
+  fi
 }

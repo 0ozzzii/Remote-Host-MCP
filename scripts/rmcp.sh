@@ -2,6 +2,10 @@
 set -euo pipefail
 
 resolve_root() {
+  if [[ -n "${RMCP_CONTROLLER_ROOT:-}" && -d "$RMCP_CONTROLLER_ROOT" && -f "$RMCP_CONTROLLER_ROOT/installer/install.sh" ]]; then
+    printf '%s\n' "$RMCP_CONTROLLER_ROOT"
+    return
+  fi
   if [[ -n "${RMCP_INSTALL_STATE:-}" && -f "$RMCP_INSTALL_STATE" ]]; then
     # shellcheck disable=SC1090
     source "$RMCP_INSTALL_STATE"
@@ -41,7 +45,7 @@ source "$ROOT/scripts/lib.sh"
 
 VERSION="$(tr -d '\r\n' < "$ROOT/VERSION" 2>/dev/null || printf 'unknown')"
 if [[ -n "$STATE_FILE" && -f "$STATE_FILE" ]]; then
-  load_install_layout_from_state "$STATE_FILE"
+  load_install_layout_from_state "$STATE_FILE" || die 'Install state contains an unsafe or invalid layout.'
   load_locale "${RHMCP_LANGUAGE:-en_US}"
 else
   load_locale "${RHMCP_LANGUAGE:-en_US}"
@@ -61,9 +65,9 @@ Lifecycle commands:
   uninstall --dry-run       Show exactly what owned resources would be removed
   uninstall                 Remove application/runtime/service/CLI, preserve recovery config/secrets/backups
   uninstall --purge         Remove the entire Remote Host MCP-owned namespace after confirmation
-  stray-check [--purge]     Verify lifecycle residues after uninstall
+  stray-check [--purge]     Verify known lifecycle residues
   check-update              Compare current version with the update channel
-  connection                Show connection details (capability URL is a credential)
+  connection                Explicitly show connection details; capability URL is a credential
   version                   Print version/build identity
 
 Compatibility:
@@ -79,7 +83,7 @@ service_status() {
   if [[ "${RHMCP_SERVICE_BACKEND:-portable}" == systemd ]] && command -v systemctl >/dev/null 2>&1; then
     systemctl is-active remote-host-mcp.service 2>/dev/null || true
   else
-    bash "$ROOT/scripts/manage.sh" status 2>/dev/null | head -1 || true
+    bash "$CURRENT_LINK/scripts/manage.sh" status 2>/dev/null | head -1 || true
   fi
 }
 
@@ -88,7 +92,7 @@ service_action() {
   if [[ "${RHMCP_SERVICE_BACKEND:-portable}" == systemd ]] && command -v systemctl >/dev/null 2>&1; then
     systemctl "$action" remote-host-mcp.service
   else
-    case "$action" in start|stop|restart) bash "$ROOT/scripts/manage.sh" "$action" ;; *) return 2 ;; esac
+    case "$action" in start|stop|restart) bash "$CURRENT_LINK/scripts/manage.sh" "$action" ;; *) return 2 ;; esac
   fi
 }
 
@@ -176,7 +180,7 @@ doctor_cmd() {
     else
       set +e
       RHMCP_VALIDATE_URL="$url" RHMCP_VALIDATION_BEARER_TOKEN="$bearer" RHMCP_VALIDATE_TOOL_COUNT=65 \
-        "$CURRENT_LINK/.venv/bin/python" "$CURRENT_LINK/installer/validate_mcp.py" >/dev/null
+        "$CURRENT_LINK/.venv/bin/python" "$ROOT/installer/validate_mcp.py" >/dev/null
       rc=$?
       set -e
       if [[ $rc -eq 0 ]]; then ok 'MCP initialize/tools-list/host_capabilities'; else fail 'MCP protocol gate'; failures=$((failures+1)); fi
@@ -280,7 +284,8 @@ interactive_menu() {
     clear 2>/dev/null || true
     header "Remote Host MCP $VERSION"
     printf 'Status / 状态 : %s\n' "$(service_status | head -1)"
-    printf 'Root / 路径   : %s\n' "$ROOT"
+    printf 'Root / 控制器 : %s\n' "$ROOT"
+    printf 'Runtime / 当前: %s\n' "$(readlink -f "$CURRENT_LINK" 2>/dev/null || printf missing)"
     printf 'Ingress / 接入: %s\n' "${RHMCP_INGRESS:-legacy/source}"
     subhr
     if [[ "$RMCP_LANGUAGE" == zh_CN ]]; then
@@ -317,7 +322,11 @@ case "${1:-}" in
   repair) repair_cmd ;;
   resume) resume_cmd ;;
   uninstall) uninstall_cmd "$@" ;;
-  stray-check) shift; stray_check "$([[ "${1:-}" == --purge ]] && printf true || printf false)" ;;
+  stray-check)
+    shift
+    if [[ -f "${OWNERSHIP_STATE:-}" ]]; then cache_uninstall_resources; fi
+    stray_check "$([[ "${1:-}" == --purge ]] && printf true || printf false)"
+    ;;
   check-update) check_update_cmd ;;
   connection) show_connection ;;
   '') interactive_menu ;;

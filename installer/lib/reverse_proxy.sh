@@ -12,7 +12,6 @@ generate_nginx_snippet() {
   local host="$1" port="$2" out="$3"
   cat > "$out" <<EOF2
 # Remote Host MCP generated reverse-proxy template.
-# Add TLS directives using your existing certificate manager before enabling publicly.
 server {
     listen 80;
     server_name ${host};
@@ -31,18 +30,47 @@ EOF2
 }
 
 nginx_product_config_path() {
-  if [[ -d /etc/nginx/conf.d ]]; then printf '/etc/nginx/conf.d/remote-host-mcp.conf\n';
-  elif [[ -d /etc/nginx/sites-available ]]; then printf '/etc/nginx/sites-available/remote-host-mcp.conf\n';
-  else return 1; fi
+  if [[ -n "${RHMCP_NGINX_CONFIG_PATH:-}" ]]; then
+    [[ "$RHMCP_NGINX_CONFIG_PATH" = /* ]] || return 1
+    printf '%s\n' "$RHMCP_NGINX_CONFIG_PATH"
+  elif [[ -d /etc/nginx/conf.d ]]; then
+    printf '/etc/nginx/conf.d/remote-host-mcp.conf\n'
+  elif [[ -d /etc/nginx/sites-available ]]; then
+    printf '/etc/nginx/sites-available/remote-host-mcp.conf\n'
+  else
+    return 1
+  fi
+}
+
+nginx_file_owns_host() {
+  local file="$1" host="$2"
+  awk -v host="$host" '
+    /^[[:space:]]*server_name[[:space:]]/ {
+      for (i=2; i<=NF; i++) {
+        token=$i; gsub(/;/, "", token)
+        if (token == host) found=1
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$file" 2>/dev/null
 }
 
 nginx_host_conflict() {
   local host="$1" ours="$2" file
   for file in /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/* /etc/nginx/sites-available/*; do
     [[ -f "$file" && "$file" != "$ours" ]] || continue
-    if grep -Eq "server_name[[:space:]][^;]*($host)([[:space:];]|$)" "$file" 2>/dev/null; then printf '%s\n' "$file"; return 0; fi
+    if nginx_file_owns_host "$file" "$host"; then printf '%s\n' "$file"; return 0; fi
   done
   return 1
+}
+
+reload_nginx_safely() {
+  nginx -t
+  if systemd_operational && systemctl is-active nginx >/dev/null 2>&1; then
+    systemctl reload nginx
+  else
+    nginx -s reload 2>/dev/null || nginx
+  fi
 }
 
 write_managed_nginx_http() {
@@ -59,12 +87,12 @@ write_managed_nginx_http() {
     return 2
   fi
   install -d -m 755 "$webroot/.well-known/acme-challenge"
+  install -d -m 755 "$(dirname "$config")"
   tmp="${config}.tmp.$$"
   cat > "$tmp" <<EOF2
 # Managed-By: remote-host-mcp
 server {
     listen 80;
-    listen [::]:80;
     server_name ${host};
 
     location ^~ /.well-known/acme-challenge/ {
@@ -92,33 +120,31 @@ EOF2
     ln -sfn "$config" "$link"
     record_resource nginx_site_link "$link" created
   fi
-  nginx -t
-  if systemd_operational && systemctl is-active nginx >/dev/null 2>&1; then systemctl reload nginx; else nginx -s reload 2>/dev/null || nginx; fi
+  reload_nginx_safely
 }
 
 write_managed_nginx_https() {
-  local host="$1" port="$2" webroot="$3" cert="$4" key="$5" https_port="${6:-443}" config tmp
+  local host="$1" port="$2" webroot="$3" cert="$4" key="$5" https_port="${6:-443}" config tmp redirect_port=''
   config="$(nginx_product_config_path)" || return 1
   managed_file_has_marker "$config" || return 2
   [[ -r "$cert" && -r "$key" ]] || return 1
+  [[ "$https_port" == 443 ]] || redirect_port=":${https_port}"
   tmp="${config}.tmp.$$"
   cat > "$tmp" <<EOF2
 # Managed-By: remote-host-mcp
 server {
     listen 80;
-    listen [::]:80;
     server_name ${host};
 
     location ^~ /.well-known/acme-challenge/ {
         root ${webroot};
         default_type text/plain;
     }
-    location / { return 308 https://\$host\$request_uri; }
+    location / { return 308 https://\$host${redirect_port}\$request_uri; }
 }
 
 server {
     listen ${https_port} ssl;
-    listen [::]:${https_port} ssl;
     server_name ${host};
     ssl_certificate ${cert};
     ssl_certificate_key ${key};
@@ -139,8 +165,7 @@ server {
 }
 EOF2
   chmod 644 "$tmp"; mv -f "$tmp" "$config"
-  nginx -t
-  if systemd_operational && systemctl is-active nginx >/dev/null 2>&1; then systemctl reload nginx; else nginx -s reload; fi
+  reload_nginx_safely
 }
 
 prepare_direct_ingress() {
@@ -152,7 +177,6 @@ prepare_direct_ingress() {
       generated="$CONFIG_DIR/generated/nginx-remote-host-mcp.conf"
       generate_nginx_snippet "$host" "$port" "$generated"
       warn "Existing Nginx detected. Safe template generated: $generated"
-      warn 'Automatic TLS takeover is intentionally not forced; reuse the existing certificate/ACME system, then proxy this hostname to localhost.'
       DIRECT_READY=false
       ;;
     caddy)
@@ -162,14 +186,13 @@ prepare_direct_ingress() {
       DIRECT_READY=false
       ;;
     apache)
-      warn 'Existing Apache detected. Automatic modification is not enabled in this alpha; no existing virtual host was changed.'
+      warn 'Existing Apache detected. Automatic modification is not enabled; no existing virtual host was changed.'
       DIRECT_READY=false
       ;;
     none)
       generated="$CONFIG_DIR/generated/Caddyfile.remote-host-mcp"
       generate_caddy_block "$host" "$port" "$generated"
       warn "No reverse proxy detected. Caddy configuration generated: $generated"
-      warn 'This alpha does not silently install a new web server. Review/install Caddy, then apply the generated block.'
       DIRECT_READY=false
       ;;
   esac

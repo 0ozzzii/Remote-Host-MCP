@@ -118,6 +118,22 @@ def _inode_identity(info: os.stat_result) -> tuple[int, int]:
     return (info.st_dev, info.st_ino)
 
 
+def _rollback_exchange_if_ours(
+    parent_fd: int,
+    temporary_name: str,
+    destination_name: str,
+    published_inode: tuple[int, int],
+) -> bool:
+    """Roll back an exchange only while our published inode still owns destination."""
+    current = _lstat_at(parent_fd, destination_name)
+    temporary = _lstat_at(parent_fd, temporary_name)
+    if current is None or temporary is None or _inode_identity(current) != published_inode:
+        return False
+    rename_exchange(parent_fd, temporary_name, parent_fd, destination_name)
+    os.fsync(parent_fd)
+    return True
+
+
 def list_directory(path: str | None, limit: int, settings: Settings) -> ListDirectoryResult:
     if limit < 1 or limit > 500:
         raise ValueError("limit must be between 1 and 500")
@@ -358,28 +374,35 @@ def write_text_file(
                     if exc.errno == errno.ENOENT:
                         raise ValueError("Destination disappeared during expected_sha256 guarded replacement") from exc
                     raise
-                old_fd = os.open(
-                    tmp_name,
-                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
-                    dir_fd=parent_fd,
-                )
                 try:
-                    old_info = _fstat_regular(old_fd, message="Destination changed during guarded replacement")
-                    old_digest, _ = _hash_fd(old_fd)
-                    old_identity = _content_identity(old_info)
-                finally:
-                    os.close(old_fd)
-                if old_digest != expected or old_identity != expected_identity:
-                    current_new = _lstat_at(parent_fd, name)
-                    if current_new is not None and _inode_identity(current_new) == new_inode:
-                        rename_exchange(parent_fd, tmp_name, parent_fd, name)
-                        os.fsync(parent_fd)
-                    else:
-                        # Never destroy an unknown concurrent writer. The old
-                        # destination is preserved under the hidden temp name for
-                        # operator recovery instead of being unlinked blindly.
+                    old_entry = _lstat_at(parent_fd, tmp_name)
+                    if (
+                        old_entry is None
+                        or not stat.S_ISREG(old_entry.st_mode)
+                        or _content_identity(old_entry) != expected_identity
+                    ):
+                        raise ValueError("Destination changed during expected_sha256 guarded replacement")
+                    old_fd = os.open(
+                        tmp_name,
+                        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                        dir_fd=parent_fd,
+                    )
+                    try:
+                        old_info = _fstat_regular(old_fd, message="Destination changed during guarded replacement")
+                        old_digest, _ = _hash_fd(old_fd)
+                        old_identity = _content_identity(old_info)
+                    finally:
+                        os.close(old_fd)
+                    if old_digest != expected or old_identity != expected_identity:
+                        raise ValueError("Destination changed during expected_sha256 guarded replacement")
+                except Exception as exc:
+                    if not _rollback_exchange_if_ours(parent_fd, tmp_name, name, new_inode):
+                        # Never unlink an object belonging to an unknown concurrent
+                        # writer. Keep the exchanged entry for operator recovery.
                         preserve_tmp = True
-                    raise ValueError("Destination changed during expected_sha256 guarded replacement")
+                    if isinstance(exc, ValueError) and str(exc) == "Destination changed during expected_sha256 guarded replacement":
+                        raise
+                    raise ValueError("Destination changed during expected_sha256 guarded replacement") from exc
                 os.unlink(tmp_name, dir_fd=parent_fd)
             elif overwrite:
                 os.replace(tmp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
@@ -528,12 +551,27 @@ def move_path(source: str, destination: str, overwrite: bool, settings: Settings
                     os.close(check_fd)
 
             src_inode = _inode_identity(src_stat)
+            dst_inode = _inode_identity(dst_stat)
             try:
                 rename_exchange(src_fd, src_name, dst_fd, dst_name)
             except OSError as exc:
                 if exc.errno == errno.EXDEV:
                     raise ValueError("Secure cross-filesystem move is not supported; copy then remove explicitly") from exc
                 raise
+            exchanged_old = _lstat_at(src_fd, src_name)
+            if exchanged_old is None or _inode_identity(exchanged_old) != dst_inode:
+                current_dst = _lstat_at(dst_fd, dst_name)
+                current_src = _lstat_at(src_fd, src_name)
+                if (
+                    current_dst is not None
+                    and current_src is not None
+                    and _inode_identity(current_dst) == src_inode
+                ):
+                    rename_exchange(src_fd, src_name, dst_fd, dst_name)
+                    os.fsync(dst_fd)
+                    if src_fd != dst_fd:
+                        os.fsync(src_fd)
+                raise ValueError("Destination changed during move commit")
             try:
                 _remove_tree_at(src_fd, src_name)
             except Exception:
@@ -543,6 +581,7 @@ def move_path(source: str, destination: str, overwrite: bool, settings: Settings
                     current_dst is not None
                     and current_src is not None
                     and _inode_identity(current_dst) == src_inode
+                    and _inode_identity(current_src) == dst_inode
                 ):
                     rename_exchange(src_fd, src_name, dst_fd, dst_name)
                     os.fsync(dst_fd)
@@ -647,8 +686,16 @@ def copy_path(source: str, destination: str, recursive: bool, overwrite: bool, s
                         raise ValueError("Destination changed during copy commit")
                     if not overwrite:
                         raise ValueError("Destination appeared during copy and overwrite=false")
+                    expected_old_inode = _inode_identity(current_dst)
                     rename_exchange(dst_fd, staging_name, dst_fd, dst_name)
                     committed = True
+                    exchanged_old = _lstat_at(dst_fd, staging_name)
+                    if exchanged_old is None or _inode_identity(exchanged_old) != expected_old_inode:
+                        if _rollback_exchange_if_ours(dst_fd, staging_name, dst_name, staged_inode):
+                            committed = False
+                        else:
+                            preserve_staging = True
+                        raise ValueError("Destination changed during copy commit")
                     try:
                         _remove_tree_at(dst_fd, staging_name)
                     except Exception:

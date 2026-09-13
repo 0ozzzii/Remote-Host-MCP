@@ -135,6 +135,90 @@ def test_expected_sha_guard_rolls_back_concurrent_replacement(
     assert target.read_text(encoding="utf-8") == "competitor"
 
 
+
+def test_expected_sha_symlink_swap_rolls_back_without_touching_victim(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = settings(monkeypatch, tmp_path)
+    target = tmp_path / "cas-symlink.txt"
+    victim = tmp_path / "victim.txt"
+    target.write_text("original", encoding="utf-8")
+    victim.write_text("victim", encoding="utf-8")
+    expected = hashlib.sha256(b"original").hexdigest()
+    real = filesystem.rename_exchange
+    injected = False
+
+    def race(src_fd: int, src: str, dst_fd: int, dst: str) -> None:
+        nonlocal injected
+        if not injected:
+            injected = True
+            target.unlink()
+            target.symlink_to(victim)
+        real(src_fd, src, dst_fd, dst)
+
+    monkeypatch.setattr(filesystem, "rename_exchange", race)
+    with pytest.raises(ValueError, match="changed during expected_sha256"):
+        write_text_file(str(target), "ours", True, expected, 0o600, cfg)
+    assert target.is_symlink()
+    assert target.resolve() == victim.resolve()
+    assert victim.read_text(encoding="utf-8") == "victim"
+
+
+def test_copy_overwrite_destination_swap_is_preserved(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = settings(monkeypatch, tmp_path)
+    source = tmp_path / "copy-source.txt"
+    destination = tmp_path / "copy-destination.txt"
+    source.write_text("ours", encoding="utf-8")
+    destination.write_text("old", encoding="utf-8")
+    real = filesystem.rename_exchange
+    injected = False
+
+    def race(src_fd: int, src: str, dst_fd: int, dst: str) -> None:
+        nonlocal injected
+        if not injected:
+            injected = True
+            competitor = tmp_path / "copy-competitor.tmp"
+            competitor.write_text("competitor", encoding="utf-8")
+            os.replace(competitor, destination)
+        real(src_fd, src, dst_fd, dst)
+
+    monkeypatch.setattr(filesystem, "rename_exchange", race)
+    with pytest.raises(ValueError, match="Destination changed during copy commit"):
+        copy_path(str(source), str(destination), False, True, cfg)
+    assert destination.read_text(encoding="utf-8") == "competitor"
+    assert source.read_text(encoding="utf-8") == "ours"
+
+
+def test_move_overwrite_destination_swap_is_preserved(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = settings(monkeypatch, tmp_path)
+    source = tmp_path / "move-source.txt"
+    destination = tmp_path / "move-destination.txt"
+    source.write_text("ours", encoding="utf-8")
+    destination.write_text("old", encoding="utf-8")
+    real = filesystem.rename_exchange
+    injected = False
+
+    def race(src_fd: int, src: str, dst_fd: int, dst: str) -> None:
+        nonlocal injected
+        if not injected:
+            injected = True
+            competitor = tmp_path / "move-competitor.tmp"
+            competitor.write_text("competitor", encoding="utf-8")
+            os.replace(competitor, destination)
+        real(src_fd, src, dst_fd, dst)
+
+    monkeypatch.setattr(filesystem, "rename_exchange", race)
+    from remote_host_mcp.filesystem import move_path
+    with pytest.raises(ValueError, match="Destination changed during move commit"):
+        move_path(str(source), str(destination), True, cfg)
+    assert source.read_text(encoding="utf-8") == "ours"
+    assert destination.read_text(encoding="utf-8") == "competitor"
+
+
 def test_copy_failure_never_destroys_existing_destination(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

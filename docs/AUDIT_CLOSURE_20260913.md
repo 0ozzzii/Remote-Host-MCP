@@ -5,6 +5,7 @@ This change set closes the remaining findings consolidated from the functional s
 ## Code changes
 
 - Race-free `overwrite=false` publication uses Linux `renameat2(RENAME_NOREPLACE)` for text writes, copies, moves and upload finalization.
+- Exchange-based overwrite/CAS commits verify the exact displaced inode and roll back if a concurrent destination swap wins the pre-commit race, including symlink/type swaps.
 - Guarded text replacement uses `RENAME_EXCHANGE` plus verification/rollback so a concurrent destination replacement is not destroyed.
 - `copy_path(overwrite=true)` stages the entire copy before atomic publication; failed copies leave the previous destination intact.
 - `make_directory(exist_ok=true)` no longer chmods an already-existing directory.

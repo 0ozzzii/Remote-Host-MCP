@@ -9,19 +9,23 @@ cache_uninstall_resources() {
   UNINSTALL_CHECK_TUNNEL_UNIT="$(resource_value tunnel_service_unit PATH 2>/dev/null || true)"
   UNINSTALL_CHECK_RENEW_SERVICE="$(resource_value cert_renew_service PATH 2>/dev/null || true)"
   UNINSTALL_CHECK_RENEW_TIMER="$(resource_value cert_renew_timer PATH 2>/dev/null || true)"
+  UNINSTALL_CHECK_RENEW_PID="$(resource_value portable_cert_renew_pid PATH 2>/dev/null || true)"
+  UNINSTALL_CHECK_RENEW_LOOP="$(resource_value cert_renew_loop PATH 2>/dev/null || true)"
   UNINSTALL_CHECK_NGINX_SITE="$(resource_value nginx_site PATH 2>/dev/null || true)"
   UNINSTALL_CHECK_NGINX_LINK="$(resource_value nginx_site_link PATH 2>/dev/null || true)"
   UNINSTALL_CHECK_PORT="${RHMCP_LOCAL_PORT:-${LOCAL_PORT:-8765}}"
-  export UNINSTALL_CHECK_CLI UNINSTALL_CHECK_UNIT UNINSTALL_CHECK_TUNNEL_UNIT UNINSTALL_CHECK_RENEW_SERVICE UNINSTALL_CHECK_RENEW_TIMER UNINSTALL_CHECK_NGINX_SITE UNINSTALL_CHECK_NGINX_LINK UNINSTALL_CHECK_PORT
+  export UNINSTALL_CHECK_CLI UNINSTALL_CHECK_UNIT UNINSTALL_CHECK_TUNNEL_UNIT UNINSTALL_CHECK_RENEW_SERVICE UNINSTALL_CHECK_RENEW_TIMER UNINSTALL_CHECK_RENEW_PID UNINSTALL_CHECK_RENEW_LOOP UNINSTALL_CHECK_NGINX_SITE UNINSTALL_CHECK_NGINX_LINK UNINSTALL_CHECK_PORT
 }
 
 uninstall_plan() {
-  local purge="${1:-false}" cli unit tunnel_unit renew_service renew_timer nginx_site nginx_link cert_name
+  local purge="${1:-false}" cli unit tunnel_unit renew_service renew_timer renew_pid renew_loop nginx_site nginx_link cert_name
   cli="$(resource_value rmcp_cli PATH 2>/dev/null || true)"
   unit="$(resource_value service_unit PATH 2>/dev/null || true)"
   tunnel_unit="$(resource_value tunnel_service_unit PATH 2>/dev/null || true)"
   renew_service="$(resource_value cert_renew_service PATH 2>/dev/null || true)"
   renew_timer="$(resource_value cert_renew_timer PATH 2>/dev/null || true)"
+  renew_pid="$(resource_value portable_cert_renew_pid PATH 2>/dev/null || true)"
+  renew_loop="$(resource_value cert_renew_loop PATH 2>/dev/null || true)"
   nginx_site="$(resource_value nginx_site PATH 2>/dev/null || true)"
   nginx_link="$(resource_value nginx_site_link PATH 2>/dev/null || true)"
   cert_name="$(resource_value certificate PATH 2>/dev/null || true)"
@@ -34,6 +38,8 @@ uninstall_plan() {
   [[ -n "$tunnel_unit" ]] && _uninstall_print REMOVE "owned tunnel unit: $tunnel_unit"
   [[ -n "$renew_service" ]] && _uninstall_print REMOVE "owned certificate renewal service: $renew_service"
   [[ -n "$renew_timer" ]] && _uninstall_print REMOVE "owned certificate renewal timer: $renew_timer"
+  [[ -n "$renew_pid" ]] && _uninstall_print REMOVE "owned portable certificate renewal process: $renew_pid"
+  [[ -n "$renew_loop" ]] && _uninstall_print REMOVE "owned portable certificate renewal loop: $renew_loop"
   [[ -n "$nginx_link" ]] && _uninstall_print REMOVE "owned Nginx enable link: $nginx_link"
   [[ -n "$nginx_site" ]] && _uninstall_print REMOVE "owned ingress file: $nginx_site"
   _uninstall_print KEEP 'system Nginx/Caddy/Apache, Certbot/Python packages and unrelated services'
@@ -73,10 +79,23 @@ _wait_port_release() {
 }
 
 _stop_owned_services() {
-  local port="${RHMCP_LOCAL_PORT:-${LOCAL_PORT:-8765}}"
+  local port="${RHMCP_LOCAL_PORT:-${LOCAL_PORT:-8765}}" renew_pid renew_loop
   _disable_owned_systemd_resource cert_renew_timer
   _disable_owned_systemd_resource tunnel_service_unit
   _disable_owned_systemd_resource service_unit
+  renew_pid="$(resource_value portable_cert_renew_pid PATH 2>/dev/null || true)"
+  renew_loop="$(resource_value cert_renew_loop PATH 2>/dev/null || true)"
+  if [[ -n "$renew_pid" ]] && resource_owned portable_cert_renew_pid; then
+    if declare -F stop_portable_renewal >/dev/null 2>&1; then
+      stop_portable_renewal "$renew_pid" "${renew_loop:-$CERTBOT_DIR/renew-loop.sh}" || {
+        fail 'Portable certificate renewal stop failed; refusing destructive cleanup while process identity is unresolved.'
+        return 1
+      }
+    elif [[ -f "$renew_pid" ]]; then
+      fail 'Portable certificate renewal is recorded but its identity-aware stop helper is unavailable; refusing destructive cleanup.'
+      return 1
+    fi
+  fi
   if [[ "${RHMCP_SERVICE_BACKEND:-}" == portable && -x "${CURRENT_LINK:-}/scripts/manage.sh" ]]; then
     (cd "$CURRENT_LINK" && bash scripts/manage.sh tunnel-stop >/dev/null 2>&1) || true
     if ! (cd "$CURRENT_LINK" && bash scripts/manage.sh stop); then
@@ -158,6 +177,7 @@ uninstall_apply() {
   _stop_owned_services || die 'Failed to stop Remote Host MCP-owned services; uninstall aborted before payload removal.'
   _remove_owned_file_resource cert_renew_timer
   _remove_owned_file_resource cert_renew_service
+  _remove_owned_file_resource cert_renew_loop
   _remove_owned_file_resource tunnel_service_unit
   _remove_owned_file_resource service_unit
   _remove_owned_file_resource nginx_site_link
@@ -199,6 +219,9 @@ stray_check() {
   _stray_path_absent 'stray tunnel unit' "${UNINSTALL_CHECK_TUNNEL_UNIT:-}" failures
   _stray_path_absent 'stray renewal service' "${UNINSTALL_CHECK_RENEW_SERVICE:-}" failures
   _stray_path_absent 'stray renewal timer' "${UNINSTALL_CHECK_RENEW_TIMER:-}" failures
+  _stray_path_absent 'stray portable renewal pidfile' "${UNINSTALL_CHECK_RENEW_PID:-}" failures
+  _stray_path_absent 'stray portable renewal start-ticks' "${UNINSTALL_CHECK_RENEW_PID:+${UNINSTALL_CHECK_RENEW_PID}.start_ticks}" failures
+  _stray_path_absent 'stray portable renewal loop' "${UNINSTALL_CHECK_RENEW_LOOP:-}" failures
   _stray_path_absent 'stray Nginx site' "${UNINSTALL_CHECK_NGINX_SITE:-}" failures
   _stray_path_absent 'stray Nginx enable link' "${UNINSTALL_CHECK_NGINX_LINK:-}" failures
   [[ -z "${CURRENT_LINK:-}" || ! -e "$CURRENT_LINK" ]] || { fail "stray current link: $CURRENT_LINK"; failures=$((failures+1)); }

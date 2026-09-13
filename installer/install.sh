@@ -21,6 +21,7 @@ source "$SELF_DIR/lib/uninstall.sh"
 RMCP_VERSION="$(tr -d '\r\n' < "$SOURCE_ROOT/VERSION")"
 ACTION='install'
 RESUME_MODE=false
+RESUME_FROM_STAGE='NONE'
 AUTHORITY='user'
 INGRESS=''
 DOMAIN_DNS_MODE='unknown'
@@ -61,6 +62,13 @@ parse_args() {
   done
 }
 
+prime_state_context() {
+  [[ -n "${RMCP_INSTALL_STATE:-}" && -f "$RMCP_INSTALL_STATE" ]] || return 0
+  # Installer-owned metadata supplied by the installed rmcp launcher.
+  # shellcheck disable=SC1090
+  source "$RMCP_INSTALL_STATE"
+}
+
 on_exit() {
   local rc=$?
   trap - EXIT
@@ -78,8 +86,33 @@ on_exit() {
 }
 trap on_exit EXIT
 
+stage_rank() {
+  case "$1" in
+    NONE) printf '0\n' ;;
+    PRECHECK) printf '10\n' ;;
+    PREPARE) printf '20\n' ;;
+    RELEASE) printf '30\n' ;;
+    RUNTIME) printf '40\n' ;;
+    CLI_RECOVERY) printf '50\n' ;;
+    SERVICE) printf '60\n' ;;
+    LOCAL_READY) printf '70\n' ;;
+    INGRESS) printf '80\n' ;;
+    TLS) printf '90\n' ;;
+    PUBLIC_READY) printf '100\n' ;;
+    MCP_VERIFY) printf '110\n' ;;
+    COMPLETE) printf '120\n' ;;
+    *) printf '0\n' ;;
+  esac
+}
+
+resume_has_stage() {
+  local target="$1"
+  [[ "$RESUME_MODE" == true ]] || return 1
+  (( $(stage_rank "$RESUME_FROM_STAGE") >= $(stage_rank "$target") ))
+}
+
 stage_done() {
-  LAST_COMPLETED_STAGE="$1"
+  LAST_COMPLEED_STAGE="$1"
   write_progress_state INCOMPLETE "$LAST_COMPLETED_STAGE" ''
 }
 
@@ -102,6 +135,7 @@ preflight() {
   ok "Python $(python3 --version 2>&1 | awk '{print $2}')"
   command_exists curl && ok 'curl' || die 'curl is required / 需要 curl'
   command_exists tar && ok 'tar' || die 'tar is required / 需要 tar'
+  command_exists openssl && ok 'openssl' || die 'openssl is required / 需要 openssl'
   python_venv_preflight || die 'Python venv/ensurepip is required. / 需要 Python venv/ensurepip。'
   ok 'Python venv + ensurepip'
   command_exists ssh && ok 'OpenSSH client' || warn 'ssh client not found; ssh_* tools will fail closed until OpenSSH is installed'
@@ -158,7 +192,13 @@ PY
       PATH_KEY=''
       read -r -p 'OAuth issuer (https://...) / OAuth Issuer: ' OAUTH_ISSUER
       read -r -p 'JWKS URL (https://...) / JWKS 地址: ' OAUTH_JWKS_URL
-      if [[ "$INGRESS" == private ]]; then scheme_host="http://127.0.0.1:${LOCAL_PORT}"; else scheme_host="https://${PUBLIC_HOST}${PUBLIC_HTTPS_PORT:+:$PUBLIC_HTTPS_PORT}"; [[ "$PUBLIC_HTTPS_PORT" == 443 ]] && scheme_host="https://${PUBLIC_HOST}"; fi
+      if [[ "$INGRESS" == private ]]; then
+        scheme_host="http://127.0.0.1:${LOCAL_PORT}"
+      elif [[ "$PUBLIC_HTTPS_PORT" == 443 ]]; then
+        scheme_host="https://${PUBLIC_HOST}"
+      else
+        scheme_host="https://${PUBLIC_HOST}:${PUBLIC_HTTPS_PORT}"
+      fi
       default_audience="${scheme_host}/mcp"
       read -r -p "OAuth audience [${default_audience}]: " OAUTH_AUDIENCE
       OAUTH_AUDIENCE="${OAUTH_AUDIENCE:-$default_audience}"
@@ -222,8 +262,12 @@ choose_ingress() {
 
 write_env() {
   local env_file="$CONFIG_DIR/rhmcp.env" roots user_home
-  if [[ "$AUTHORITY" == root ]]; then roots='/'; else
-    user_home="$(getent passwd "$SERVICE_USER" 2>/dev/null | cut -d: -f6)"; user_home="${user_home:-${HOME:-/tmp}}"; roots="${user_home}:/tmp"
+  if [[ "$AUTHORITY" == root ]]; then
+    roots='/'
+  else
+    user_home="$(getent passwd "$SERVICE_USER" 2>/dev/null | cut -d: -f6)"
+    user_home="${user_home:-${HOME:-/tmp}}"
+    roots="${user_home}:/tmp"
   fi
   umask 077
   cat > "$env_file" <<EOF2
@@ -261,7 +305,10 @@ EOF2
 load_resume_env() {
   local env_file="$CONFIG_DIR/rhmcp.env"
   [[ -f "$env_file" ]] || die 'Resume requires existing rhmcp.env; secrets will not be reconstructed.'
-  set -a; source "$env_file"; set +a
+  set -a
+  # shellcheck disable=SC1090
+  source "$env_file"
+  set +a
   AUTH_MODE="${RHMCP_AUTH_MODE:-$AUTH_MODE}"
   PATH_KEY="${RHMCP_PATH_KEY:-}"
   PUBLIC_HOST="${RHMCP_PUBLIC_HOST:-$PUBLIC_HOST}"
@@ -269,7 +316,10 @@ load_resume_env() {
   DOMAIN_DNS_MODE="${RHMCP_DOMAIN_DNS_MODE:-$DOMAIN_DNS_MODE}"
   PUBLIC_HTTPS_PORT="${RHMCP_PUBLIC_HTTPS_PORT:-$PUBLIC_HTTPS_PORT}"
   ACME_EMAIL="${RHMCP_ACME_EMAIL:-$ACME_EMAIL}"
-  OAUTH_ISSUER="${RHMCP_OAUTH_ISSUER:-}"; OAUTH_JWKS_URL="${RHMCP_OAUTH_JWKS_URL:-}"; OAUTH_AUDIENCE="${RHMCP_OAUTH_AUDIENCE:-}"; OAUTH_SCOPES="${RHMCP_OAUTH_SCOPES:-remote-host}"
+  OAUTH_ISSUER="${RHMCP_OAUTH_ISSUER:-}"
+  OAUTH_JWKS_URL="${RHMCP_OAUTH_JWKS_URL:-}"
+  OAUTH_AUDIENCE="${RHMCP_OAUTH_AUDIENCE:-}"
+  OAUTH_SCOPES="${RHMCP_OAUTH_SCOPES:-remote-host}"
 }
 
 copy_release() {
@@ -355,8 +405,8 @@ configure_ingress() {
       fi
       ;;
     domain)
-      [[ $EUID -eq 0 ]] || die 'Managed Domain HTTPS 443 requires root/sudo.'
-      if [[ "$DOMAIN_DNS_MODE" == cloudflare-* ]]; then configure_cloudflare_dns_secret; fi
+      [[ $EUID -eq 0 ]] || die 'Managed Domain HTTPS requires root/sudo.'
+      if [[ "$DOMAIN_DNS_MODE" == cloudflare-proxied ]]; then configure_cloudflare_dns_secret; fi
       configure_domain_https "$PUBLIC_HOST" "$ACME_EMAIL" "$DOMAIN_DNS_MODE" "$PUBLIC_HTTPS_PORT"
       PUBLIC_READY=true
       ;;
@@ -369,10 +419,22 @@ configure_ingress() {
   esac
 }
 
+public_health_reusable() {
+  local url rc
+  [[ "$INGRESS" != private ]] || return 0
+  if [[ "$PUBLIC_HTTPS_PORT" == 443 ]]; then url="https://${PUBLIC_HOST}/health"; else url="https://${PUBLIC_HOST}:${PUBLIC_HTTPS_PORT}/health"; fi
+  set +e; external_http_probe "$url" 200; rc=$?; set -e
+  [[ $rc -eq 0 ]]
+}
+
 mcp_final_validation() {
   local base url bearer="${RHMCP_VALIDATION_BEARER_TOKEN:-}"
-  if [[ "$INGRESS" == private ]]; then base="http://127.0.0.1:${LOCAL_PORT}"; else
-    if [[ "$PUBLIC_HTTPS_PORT" == 443 ]]; then base="https://${PUBLIC_HOST}"; else base="https://${PUBLIC_HOST}:${PUBLIC_HTTPS_PORT}"; fi
+  if [[ "$INGRESS" == private ]]; then
+    base="http://127.0.0.1:${LOCAL_PORT}"
+  elif [[ "$PUBLIC_HTTPS_PORT" == 443 ]]; then
+    base="https://${PUBLIC_HOST}"
+  else
+    base="https://${PUBLIC_HOST}:${PUBLIC_HTTPS_PORT}"
   fi
   if [[ "$AUTH_MODE" == capability ]]; then
     [[ -n "$PATH_KEY" ]] || die 'Capability path key is missing.'
@@ -396,12 +458,16 @@ show_result() {
   if [[ "$INGRESS" != private ]]; then printf 'Public endpoint / 公网 : https://%s%s\n' "$PUBLIC_HOST" "$([[ "$PUBLIC_HTTPS_PORT" == 443 ]] && printf '' || printf ':%s' "$PUBLIC_HTTPS_PORT")"; fi
   if [[ "$AUTH_MODE" == capability ]]; then
     subhr
-    if [[ "$INGRESS" == private ]]; then printf '%s:\n\nhttp://127.0.0.1:%s/mcp/%s\n\n' "$(t copy_url)" "$LOCAL_PORT" "$PATH_KEY"; else printf '%s:\n\nhttps://%s%s/mcp/%s\n\n' "$(t copy_url)" "$PUBLIC_HOST" "$([[ "$PUBLIC_HTTPS_PORT" == 443 ]] && printf '' || printf ':%s' "$PUBLIC_HTTPS_PORT")" "$PATH_KEY"; fi
+    if [[ "$INGRESS" == private ]]; then
+      printf '%s:\n\nhttp://127.0.0.1:%s/mcp/%s\n\n' "$(t copy_url)" "$LOCAL_PORT" "$PATH_KEY"
+    else
+      printf '%s:\n\nhttps://%s%s/mcp/%s\n\n' "$(t copy_url)" "$PUBLIC_HOST" "$([[ "$PUBLIC_HTTPS_PORT" == 443 ]] && printf '' || printf ':%s' "$PUBLIC_HTTPS_PORT")" "$PATH_KEY"
+    fi
     warn "$(t secret_warn)"
   else
     printf 'Authentication / 认证 : OAuth 2.1\n'
   fi
-  hr; printf 'Management / 管理: rmcp\n'
+  hr; printf 'Management / 管理: rmcp status | rmcp doctor | rmcp uninstall --dry-run\n'
 }
 
 handle_existing_transaction() {
@@ -428,6 +494,7 @@ handle_existing_transaction() {
   case "$ACTION" in
     resume)
       [[ "${TARGET_COMMIT:-}" == "$source_commit" ]] || die "Resume requires original commit ${TARGET_COMMIT:-unknown}; current source is $source_commit."
+      RESUME_FROM_STAGE="${LAST_COMPLETED_STAGE:-NONE}"
       restore_transaction_state || die 'Incomplete transaction metadata is not resumable.'
       RESUME_MODE=true
       load_resume_env
@@ -441,11 +508,12 @@ handle_existing_transaction() {
       restore_transaction_state || true
       LOCAL_PORT="${TARGET_LOCAL_PORT:-$LOCAL_PORT}"
       if resource_owned certificate && [[ "${RHMCP_PURGE_CERTIFICATES:-0}" != 1 ]]; then
-        warn 'Incomplete install owns an ACME certificate. Set RHMCP_PURGE_CERTIFICATES=1 after reviewing the purge plan.'
+        warn 'Incomplete install owns an ACME certificate. Review the purge plan before confirming removal.'
       fi
       uninstall_plan true
       confirm 'Apply purge of product-owned incomplete resources?' || exit 0
       RHMCP_PURGE_CERTIFICATES=1 uninstall_apply true
+      stray_check true
       exit 0
       ;;
   esac
@@ -460,15 +528,25 @@ run_repair_or_diagnose_from_state() {
   exit 0
 }
 
+prepare_action_layout() {
+  if [[ "$ACTION" == resume && -n "${RMCP_INSTALL_STATE:-}" && -f "$RMCP_INSTALL_STATE" ]]; then
+    load_install_layout_from_state "$RMCP_INSTALL_STATE" || die 'Install state contains an unsafe or invalid layout.'
+  else
+    choose_layout
+  fi
+  preflight_layout
+  resolve_build_provenance
+  handle_existing_transaction
+}
+
 main() {
   parse_args "$@"
+  prime_state_context
   if [[ "$ACTION" == repair || "$ACTION" == diagnose ]]; then run_repair_or_diagnose_from_state || true; fi
   select_language
   header "$(t title) $RMCP_VERSION"
   preflight
-  choose_layout
-  preflight_layout
-  resolve_build_provenance
+  prepare_action_layout
 
   if [[ "$ACTION" == repair || "$ACTION" == diagnose ]]; then
     [[ -f "$INSTALL_STATE" ]] || die 'No install-state found for repair/diagnose.'
@@ -477,7 +555,6 @@ main() {
     return 0
   fi
 
-  handle_existing_transaction
   if [[ "$RESUME_MODE" != true ]]; then
     choose_authority
     choose_port 8765; LOCAL_PORT="$CHOSEN_PORT"
@@ -487,38 +564,52 @@ main() {
 
   prepare_layout_dirs
   INSTALL_TRACKING=true
-  write_progress_state INCOMPLETE PRECHECK ''
-  write_install_state INCOMPLETE
-  LAST_COMPLETED_STAGE=PRECHECK
-
-  if [[ "$RESUME_MODE" != true ]]; then write_env; fi
-  stage_done PREPARE
+  if [[ "$RESUME_MODE" != true ]]; then
+    write_progress_state INCOMPLETE PRECHECK ''
+    write_install_state INCOMPLETE
+    LAST_COMPLETED_STAGE=PRECHECK
+    write_env
+    stage_done PREPARE
+  else
+    LAST_COMPLETED_STAGE="$RESUME_FROM_STAGE"
+    info "Resuming fixed commit ${RESOLVED_COMMIT} from completed stage ${RESUME_FROM_STAGE}."
+  fi
 
   copy_release
-  stage_done RELEASE
+  if ! resume_has_stage RELEASE; then stage_done RELEASE; fi
   install_runtime
-  stage_done RUNTIME
+  if ! resume_has_stage RUNTIME; then stage_done RUNTIME; fi
 
   promote_release; PROMOTED=true
   write_install_state INCOMPLETE
   install_rmcp_launcher
-  stage_done CLI_RECOVERY
+  if ! resume_has_stage CLI_RECOVERY; then stage_done CLI_RECOVERY; fi
 
-  start_service
-  stage_done SERVICE
+  if resume_has_stage SERVICE && wait_local_health "$LOCAL_PORT" 2 1; then
+    info 'Existing managed service is already healthy; reusing it.'
+  else
+    start_service
+    stage_done SERVICE
+  fi
+
   if ! wait_local_health "$LOCAL_PORT" "${RHMCP_READINESS_TIMEOUT_S:-30}" 1; then
     LAST_ERROR_CLASS=READINESS_TIMEOUT
     service_readiness_diagnostics "$LOCAL_PORT"
     return 1
   fi
   LOCAL_VALIDATED=true
-  stage_done LOCAL_READY
+  if ! resume_has_stage LOCAL_READY; then stage_done LOCAL_READY; fi
 
-  configure_ingress
-  stage_done INGRESS
-  stage_done TLS
-  [[ "$PUBLIC_READY" == true ]] || { LAST_ERROR_CLASS=PUBLIC_NOT_READY; return 1; }
-  stage_done PUBLIC_READY
+  if resume_has_stage PUBLIC_READY && public_health_reusable; then
+    PUBLIC_READY=true
+    info 'Existing public/TLS layer revalidated; skipping duplicate ingress/certificate creation.'
+  else
+    configure_ingress
+    stage_done INGRESS
+    stage_done TLS
+    [[ "$PUBLIC_READY" == true ]] || { LAST_ERROR_CLASS=PUBLIC_NOT_READY; return 1; }
+    stage_done PUBLIC_READY
+  fi
 
   mcp_final_validation
   stage_done MCP_VERIFY

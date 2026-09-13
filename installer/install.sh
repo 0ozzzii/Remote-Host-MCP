@@ -16,6 +16,7 @@ source "$SELF_DIR/lib/dns_provider.sh"
 source "$SELF_DIR/lib/domain_mode.sh"
 source "$SELF_DIR/lib/reverse_proxy.sh"
 source "$SELF_DIR/lib/tls.sh"
+source "$SELF_DIR/lib/port_hardening.sh"
 source "$SELF_DIR/lib/uninstall.sh"
 
 RMCP_VERSION="$(tr -d '\r\n' < "$SOURCE_ROOT/VERSION")"
@@ -25,8 +26,10 @@ RESUME_FROM_STAGE='NONE'
 AUTHORITY='user'
 INGRESS=''
 DOMAIN_DNS_MODE='unknown'
+DOMAIN_CHALLENGE_MODE='auto'
 PUBLIC_HOST='mcp.invalid'
 PUBLIC_HTTPS_PORT='443'
+HTTPS_LISTEN_PORT='443'
 LOCAL_PORT='8765'
 SERVICE_BACKEND='portable'
 SERVICE_USER="$(id -un)"
@@ -112,7 +115,7 @@ resume_has_stage() {
 }
 
 stage_done() {
-  LAST_COMPLEED_STAGE="$1"
+  LAST_COMPLETED_STAGE="$1"
   write_progress_state INCOMPLETE "$LAST_COMPLETED_STAGE" ''
 }
 
@@ -145,8 +148,21 @@ preflight() {
 }
 
 preflight_layout() {
-  require_disk_space_mb "$CODE_BASE" "${RHMCP_MIN_FREE_MB:-512}" || die 'Insufficient free disk space for staged install (minimum 512 MiB by default).'
-  ok 'Disk space preflight'
+  require_disk_space_mb "$CODE_BASE" "${RHMCP_BASE_MIN_FREE_MB:-256}" || die 'Insufficient free disk space for staged install (minimum 256 MiB base workspace by default).'
+  ok 'Base disk space preflight'
+}
+
+preflight_profile_resources() {
+  local default_required required
+  case "$INGRESS" in
+    private) default_required=256 ;;
+    cloudflare-tunnel) default_required=384 ;;
+    domain|public-ip) default_required=512 ;;
+    *) default_required=512 ;;
+  esac
+  required="${RHMCP_MIN_FREE_MB:-$default_required}"
+  require_disk_space_mb "$CODE_BASE" "$required" || die "Insufficient free disk space for ingress profile ${INGRESS} (minimum ${required} MiB)."
+  ok "Ingress resource preflight: ${required} MiB free-space floor"
 }
 
 choose_authority() {
@@ -210,17 +226,20 @@ PY
   esac
 }
 
-read_https_port() {
+read_https_ports() {
   local input
   read -r -p 'Public HTTPS port [443]: ' input
   PUBLIC_HTTPS_PORT="${input:-443}"
-  [[ "$PUBLIC_HTTPS_PORT" =~ ^[0-9]+$ && "$PUBLIC_HTTPS_PORT" -ge 1 && "$PUBLIC_HTTPS_PORT" -le 65535 ]] || die 'Invalid HTTPS port.'
+  [[ "$PUBLIC_HTTPS_PORT" =~ ^[0-9]+$ && "$PUBLIC_HTTPS_PORT" -ge 1 && "$PUBLIC_HTTPS_PORT" -le 65535 ]] || die 'Invalid public HTTPS port.'
+  read -r -p "Local HTTPS listen port [${PUBLIC_HTTPS_PORT}] (Enter=same; change only for provider/NAT mapping): " input
+  HTTPS_LISTEN_PORT="${input:-$PUBLIC_HTTPS_PORT}"
+  [[ "$HTTPS_LISTEN_PORT" =~ ^[0-9]+$ && "$HTTPS_LISTEN_PORT" -ge 1 && "$HTTPS_LISTEN_PORT" -le 65535 ]] || die 'Invalid local HTTPS listen port.'
 }
 
 choose_ingress() {
   header "$(t ingress)"
   printf '  1. Public IP HTTPS\n  2. Domain HTTPS\n  3. Cloudflare Tunnel\n  4. Private/local only\n'
-  local choice host mode
+  local choice host mode challenge
   read -r -p 'Select / 选择 [1-4]: ' choice
   case "$choice" in
     1)
@@ -228,7 +247,7 @@ choose_ingress() {
       read -r -p 'Public IPv4 address: ' host
       valid_ipv4 "$host" || die 'Invalid public IPv4 address.'
       PUBLIC_HOST="$host"
-      read_https_port
+      read_https_ports
       read -r -p 'ACME contact email: ' ACME_EMAIL
       [[ "$ACME_EMAIL" == *@*.* ]] || die 'Valid ACME contact email is required.'
       ;;
@@ -238,10 +257,27 @@ choose_ingress() {
       host="${host,,}"; host="${host%.}"
       valid_hostname "$host" || die 'Invalid hostname / 域名格式无效'
       PUBLIC_HOST="$host"
-      read_https_port
+      read_https_ports
       printf '  1. Cloudflare DNS only\n  2. Cloudflare Proxied (Full strict)\n  3. Other DNS provider / plain DNS\n'
       read -r -p 'DNS mode [1-3]: ' mode
-      case "$mode" in 1) DOMAIN_DNS_MODE=cloudflare-dns-only ;; 2) DOMAIN_DNS_MODE=cloudflare-proxied ;; 3) DOMAIN_DNS_MODE=other ;; *) die 'Invalid DNS mode.' ;; esac
+      case "$mode" in
+        1)
+          DOMAIN_DNS_MODE=cloudflare-dns-only
+          printf '  1. Auto: HTTP-01 first, DNS-01 fallback\n  2. DNS-01 only (no public port 80 required)\n'
+          read -r -p 'Certificate challenge [1-2, default 1]: ' challenge
+          case "${challenge:-1}" in 1) DOMAIN_CHALLENGE_MODE=auto ;; 2) DOMAIN_CHALLENGE_MODE=dns-01 ;; *) die 'Invalid certificate challenge mode.' ;; esac
+          ;;
+        2)
+          DOMAIN_DNS_MODE=cloudflare-proxied
+          DOMAIN_CHALLENGE_MODE=dns-01
+          info 'Cloudflare Proxied mode uses DNS-01; public port 80 is not required for certificate validation.'
+          ;;
+        3)
+          DOMAIN_DNS_MODE=other
+          DOMAIN_CHALLENGE_MODE=auto
+          ;;
+        *) die 'Invalid DNS mode.' ;;
+      esac
       read -r -p 'ACME contact email: ' ACME_EMAIL
       [[ "$ACME_EMAIL" == *@*.* ]] || die 'Valid ACME contact email is required.'
       ;;
@@ -250,11 +286,11 @@ choose_ingress() {
       read -r -p "$(t domain_prompt): " host
       host="${host,,}"; host="${host%.}"
       valid_hostname "$host" || die 'Invalid hostname / 域名格式无效'
-      PUBLIC_HOST="$host"; PUBLIC_HTTPS_PORT=443
+      PUBLIC_HOST="$host"; PUBLIC_HTTPS_PORT=443; HTTPS_LISTEN_PORT=443
       ;;
     4)
       INGRESS=private
-      PUBLIC_HOST=mcp.invalid; PUBLIC_HTTPS_PORT=443
+      PUBLIC_HOST=mcp.invalid; PUBLIC_HTTPS_PORT=443; HTTPS_LISTEN_PORT=443
       ;;
     *) die 'Invalid selection / 无效选项' ;;
   esac
@@ -287,7 +323,9 @@ RHMCP_BUILD_COMMIT=${RESOLVED_COMMIT}
 RHMCP_BUILD_REF=${REQUESTED_REF}
 RHMCP_INGRESS_PROFILE=${INGRESS}
 RHMCP_PUBLIC_HTTPS_PORT=${PUBLIC_HTTPS_PORT}
+RHMCP_HTTPS_LISTEN_PORT=${HTTPS_LISTEN_PORT}
 RHMCP_DOMAIN_DNS_MODE=${DOMAIN_DNS_MODE}
+RHMCP_DOMAIN_CHALLENGE_MODE=${DOMAIN_CHALLENGE_MODE}
 RHMCP_ACME_EMAIL=${ACME_EMAIL}
 EOF2
   if [[ "$AUTH_MODE" == oauth ]]; then
@@ -314,7 +352,9 @@ load_resume_env() {
   PUBLIC_HOST="${RHMCP_PUBLIC_HOST:-$PUBLIC_HOST}"
   LOCAL_PORT="${RHMCP_PORT:-$LOCAL_PORT}"
   DOMAIN_DNS_MODE="${RHMCP_DOMAIN_DNS_MODE:-$DOMAIN_DNS_MODE}"
+  DOMAIN_CHALLENGE_MODE="${RHMCP_DOMAIN_CHALLENGE_MODE:-$DOMAIN_CHALLENGE_MODE}"
   PUBLIC_HTTPS_PORT="${RHMCP_PUBLIC_HTTPS_PORT:-$PUBLIC_HTTPS_PORT}"
+  HTTPS_LISTEN_PORT="${RHMCP_HTTPS_LISTEN_PORT:-$PUBLIC_HTTPS_PORT}"
   ACME_EMAIL="${RHMCP_ACME_EMAIL:-$ACME_EMAIL}"
   OAUTH_ISSUER="${RHMCP_OAUTH_ISSUER:-}"
   OAUTH_JWKS_URL="${RHMCP_OAUTH_JWKS_URL:-}"
@@ -351,8 +391,8 @@ install_runtime() {
   rm -rf -- "$RELEASE_DIR/.venv"
   info 'Creating Python virtual environment / 创建 Python 虚拟环境'
   python3 -m venv "$RELEASE_DIR/.venv"
-  "$RELEASE_DIR/.venv/bin/python" -m pip install -q --upgrade pip
-  "$RELEASE_DIR/.venv/bin/pip" install -q "$RELEASE_DIR"
+  "$RELEASE_DIR/.venv/bin/python" -m pip install -q --no-cache-dir --upgrade pip
+  "$RELEASE_DIR/.venv/bin/pip" install -q --no-cache-dir "$RELEASE_DIR"
   [[ -x "$RELEASE_DIR/.venv/bin/remote-host-mcp" ]] || die 'Runtime install did not create remote-host-mcp entrypoint.'
 }
 
@@ -407,12 +447,12 @@ configure_ingress() {
     domain)
       [[ $EUID -eq 0 ]] || die 'Managed Domain HTTPS requires root/sudo.'
       if [[ "$DOMAIN_DNS_MODE" == cloudflare-proxied ]]; then configure_cloudflare_dns_secret; fi
-      configure_domain_https "$PUBLIC_HOST" "$ACME_EMAIL" "$DOMAIN_DNS_MODE" "$PUBLIC_HTTPS_PORT"
+      configure_domain_https "$PUBLIC_HOST" "$ACME_EMAIL" "$DOMAIN_DNS_MODE" "$HTTPS_LISTEN_PORT" "$PUBLIC_HTTPS_PORT" "$DOMAIN_CHALLENGE_MODE"
       PUBLIC_READY=true
       ;;
     public-ip)
       [[ $EUID -eq 0 ]] || die 'Managed Public IP HTTPS requires root/sudo.'
-      configure_public_ip_https "$PUBLIC_HOST" "$ACME_EMAIL" "$PUBLIC_HTTPS_PORT"
+      configure_public_ip_https "$PUBLIC_HOST" "$ACME_EMAIL" "$HTTPS_LISTEN_PORT" "$PUBLIC_HTTPS_PORT"
       PUBLIC_READY=true
       ;;
     *) die "Unknown ingress profile: $INGRESS" ;;
@@ -455,7 +495,10 @@ mcp_final_validation() {
 show_result() {
   header "$(t done)"
   printf 'Version / 版本        : %s\nBuild commit / 提交   : %s\nBuild ref / 引用      : %s\nInstall root / 路径   : %s\nAuthority / 权限      : %s\nIngress / 接入        : %s\nLocal endpoint / 本地 : http://127.0.0.1:%s\n' "$RMCP_VERSION" "$RESOLVED_COMMIT" "$REQUESTED_REF" "$CODE_BASE" "$AUTHORITY" "$INGRESS" "$LOCAL_PORT"
-  if [[ "$INGRESS" != private ]]; then printf 'Public endpoint / 公网 : https://%s%s\n' "$PUBLIC_HOST" "$([[ "$PUBLIC_HTTPS_PORT" == 443 ]] && printf '' || printf ':%s' "$PUBLIC_HTTPS_PORT")"; fi
+  if [[ "$INGRESS" != private ]]; then
+    printf 'Public endpoint / 公网 : https://%s%s\n' "$PUBLIC_HOST" "$([[ "$PUBLIC_HTTPS_PORT" == 443 ]] && printf '' || printf ':%s' "$PUBLIC_HTTPS_PORT")"
+    if [[ "$INGRESS" == domain || "$INGRESS" == public-ip ]]; then printf 'HTTPS listen / 本机   : %s\n' "$HTTPS_LISTEN_PORT"; fi
+  fi
   if [[ "$AUTH_MODE" == capability ]]; then
     subhr
     if [[ "$INGRESS" == private ]]; then
@@ -467,7 +510,7 @@ show_result() {
   else
     printf 'Authentication / 认证 : OAuth 2.1\n'
   fi
-  hr; printf 'Management / 管理: rmcp status | rmcp doctor | rmcp uninstall --dry-run\n'
+  hr; printf 'Management / 管理: rmcp status | rmcp doctor | rmcp configure | rmcp uninstall --dry-run\n'
 }
 
 handle_existing_transaction() {
@@ -476,7 +519,7 @@ handle_existing_transaction() {
   if [[ -f "$INSTALL_STATE" ]]; then
     load_install_state "$INSTALL_STATE" || true
     if [[ "${RHMCP_INSTALL_STATUS:-}" == COMPLETE && "$ACTION" == install ]]; then
-      die 'A complete installation already exists. Use rmcp status/doctor/repair or uninstall before reinstalling.'
+      die 'A complete installation already exists. Use rmcp status/doctor/repair/configure or uninstall before reinstalling.'
     fi
   fi
   if [[ ! -f "$PROGRESS_STATE" ]]; then
@@ -559,6 +602,7 @@ main() {
     choose_authority
     choose_port 8765; LOCAL_PORT="$CHOSEN_PORT"
     choose_ingress
+    preflight_profile_resources
     choose_auth
   fi
 

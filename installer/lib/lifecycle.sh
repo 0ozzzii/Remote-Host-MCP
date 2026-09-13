@@ -239,7 +239,7 @@ repair_ingress_lifecycle() {
         CERT_RENEWAL_MODE="$cert_mode"
         export CERT_NAME CERT_FULLCHAIN CERT_PRIVKEY CERT_RENEWAL_MODE
         if [[ -z "$config" ]]; then die 'No supported Nginx product config path is available for repair.'; fi
-        if [[ -e "$config" && ! managed_file_has_marker "$config" ]]; then
+        if [[ -e "$config" ]] && ! managed_file_has_marker "$config"; then
           die "Foreign Nginx config occupies product path: $config"
         fi
         if [[ ! -e "$config" ]]; then

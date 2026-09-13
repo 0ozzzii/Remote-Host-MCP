@@ -30,8 +30,10 @@ jobs:
           python scripts/apply_alpha3_ssh_artifacts.py
           python scripts/finalize_alpha3_transform.py
 
-      - name: Keep this workflow until connector cleanup
-        run: git checkout HEAD -- .github/workflows/alpha3-feature-apply.yml
+      - name: Keep workflow files for connector-managed cleanup
+        run: |
+          git checkout HEAD -- .github/workflows/alpha3-feature-apply.yml
+          git checkout HEAD -- .github/workflows/validation.yml
 
       - name: Install candidate and dev dependencies
         run: |

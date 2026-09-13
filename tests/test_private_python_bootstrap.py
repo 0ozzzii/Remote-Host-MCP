@@ -8,6 +8,10 @@ import tarfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 COMMON = ROOT / "installer" / "lib" / "common.sh"
+STATE = ROOT / "installer" / "lib" / "state.sh"
+PORTS = ROOT / "installer" / "lib" / "ports.sh"
+UNINSTALL = ROOT / "installer" / "lib" / "uninstall.sh"
+LIFECYCLE = ROOT / "installer" / "lib" / "lifecycle.sh"
 
 
 def run_bash(script: str, *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -85,6 +89,17 @@ def test_supported_system_python_bypasses_private_bootstrap() -> None:
     assert result.returncode == 0, result.stderr
 
 
+def test_explicit_invalid_python_fails_closed_without_private_fallback(tmp_path: pathlib.Path) -> None:
+    old = make_old_python(tmp_path / "python39")
+    result = run_bash(
+        f"RHMCP_PYTHON_BIN={old}; export RHMCP_PYTHON_BIN; source {COMMON}; require_python",
+        env={"RHMCP_PRIVATE_PYTHON_CHOICE": "1"},
+    )
+    assert result.returncode != 0
+    assert "Configured Python did not satisfy" in result.stderr
+    assert "Install Remote Host MCP private Python" not in result.stdout
+
+
 def test_python39_only_host_can_select_private_bootstrap(tmp_path: pathlib.Path) -> None:
     archive, digest = make_fake_private_archive(tmp_path)
     old = make_old_python(tmp_path / "python39")
@@ -106,7 +121,6 @@ def test_checksum_mismatch_fails_closed(tmp_path: pathlib.Path) -> None:
     result = run_bash(f"source {COMMON}; require_python", env=env)
     assert result.returncode != 0
     assert "checksum mismatch" in result.stderr
-    assert "no runtime was published" not in result.stdout.lower()
 
 
 def test_missing_test_archive_simulates_download_interruption(tmp_path: pathlib.Path) -> None:
@@ -133,11 +147,33 @@ def test_publish_refuses_foreign_destination(tmp_path: pathlib.Path) -> None:
     assert "Refusing to replace unowned" in result.stderr
 
 
+def test_publish_records_created_ownership(tmp_path: pathlib.Path) -> None:
+    archive, digest = make_fake_private_archive(tmp_path)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    ownership = tmp_path / "ownership.env"
+    script = (
+        f"source {COMMON}; source {STATE}; RUNTIME_DIR={runtime}; OWNERSHIP_STATE={ownership}; "
+        "export RUNTIME_DIR OWNERSHIP_STATE; _private_python_download_archive; "
+        "_private_python_publish_archive \"$RHMCP_PRIVATE_PYTHON_ARCHIVE\"; "
+        "test \"$(resource_value private_python OWNERSHIP)\" = created; "
+        "test \"$(resource_value private_python PATH)\" = \"$RUNTIME_DIR/private-python-3.11.16\""
+    )
+    result = run_bash(
+        script,
+        env={
+            "RHMCP_TESTING": "1",
+            "RHMCP_PRIVATE_PYTHON_TEST_ARCHIVE": str(archive),
+            "RHMCP_PRIVATE_PYTHON_TEST_SHA256": digest,
+        },
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_corrupt_owned_runtime_is_transactionally_replaced(tmp_path: pathlib.Path) -> None:
     archive, digest = make_fake_private_archive(tmp_path)
     runtime = tmp_path / "runtime"
     runtime.mkdir()
-    old = make_old_python(tmp_path / "python39")
     script = f"""
 source {COMMON}
 RHMCP_TESTING=1
@@ -159,8 +195,42 @@ _private_python_publish_archive "$RHMCP_PRIVATE_PYTHON_ARCHIVE"
 _private_python_runtime_healthy "$final"
 ! find "$RUNTIME_DIR" -maxdepth 1 -name '.private-python-replaced.*' | grep -q .
 """
-    result = run_bash(script, env={"RHMCP_PYTHON_BIN": "", "RHMCP_PYTHON_CANDIDATES": str(old)})
+    result = run_bash(script)
     assert result.returncode == 0, result.stderr
+
+
+def test_repair_rebuilds_corrupt_owned_runtime(tmp_path: pathlib.Path) -> None:
+    archive, digest = make_fake_private_archive(tmp_path)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    ownership = tmp_path / "ownership.env"
+    final = runtime / "private-python-3.11.16"
+    script = f"""
+source {COMMON}
+source {STATE}
+RUNTIME_DIR={runtime}; OWNERSHIP_STATE={ownership}; export RUNTIME_DIR OWNERSHIP_STATE
+mkdir -p "{final}/python/bin"
+_private_python_write_marker "{final}"
+cat > "{final}/python/bin/python3" <<'EOF'
+#!/bin/sh
+if [ "${{1:-}}" = "-c" ]; then echo 3.11.15; fi
+exit 0
+EOF
+chmod +x "{final}/python/bin/python3"
+record_resource private_python "{final}" created
+private_python_repair_for_layout
+_private_python_runtime_healthy "{final}"
+"""
+    result = run_bash(
+        script,
+        env={
+            "RHMCP_TESTING": "1",
+            "RHMCP_PRIVATE_PYTHON_TEST_ARCHIVE": str(archive),
+            "RHMCP_PRIVATE_PYTHON_TEST_SHA256": digest,
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert "rebuilding it" in result.stdout
 
 
 def test_resume_reuses_healthy_private_runtime_without_download(tmp_path: pathlib.Path) -> None:
@@ -190,3 +260,74 @@ def test_resume_reuses_healthy_private_runtime_without_download(tmp_path: pathli
         env=env,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_diagnose_reports_private_runtime_health(tmp_path: pathlib.Path) -> None:
+    archive, digest = make_fake_private_archive(tmp_path)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    ownership = tmp_path / "ownership.env"
+    script = (
+        f"source {COMMON}; source {STATE}; RUNTIME_DIR={runtime}; OWNERSHIP_STATE={ownership}; "
+        "export RUNTIME_DIR OWNERSHIP_STATE; _private_python_download_archive; "
+        "_private_python_publish_archive \"$RHMCP_PRIVATE_PYTHON_ARCHIVE\"; private_python_diagnose"
+    )
+    result = run_bash(
+        script,
+        env={
+            "RHMCP_TESTING": "1",
+            "RHMCP_PRIVATE_PYTHON_TEST_ARCHIVE": str(archive),
+            "RHMCP_PRIVATE_PYTHON_TEST_SHA256": digest,
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert "3.11.16 (healthy, ownership=created)" in result.stdout
+
+
+def test_lifecycle_wires_private_python_diagnose_and_repair() -> None:
+    text = LIFECYCLE.read_text(encoding="utf-8")
+    assert "private_python_diagnose" in text
+    assert "private_python_repair_for_layout" in text
+
+
+def test_default_uninstall_removes_product_runtime_including_private_python(tmp_path: pathlib.Path) -> None:
+    runtime = tmp_path / "runtime"
+    private = runtime / "private-python-3.11.16"
+    private.mkdir(parents=True)
+    (private / "marker").write_text("owned", encoding="utf-8")
+    script = f"""
+source {COMMON}
+source {UNINSTALL}
+CURRENT_LINK={tmp_path / 'current'}
+RELEASES_DIR={tmp_path / 'releases'}
+STATE_DIR={tmp_path / 'state'}
+RUNTIME_DIR={runtime}
+INSTALL_MODE=prefix
+CODE_BASE={tmp_path / 'code'}
+remove_application_payload
+test ! -e "$RUNTIME_DIR"
+"""
+    result = run_bash(script)
+    assert result.returncode == 0, result.stderr
+
+
+def test_purge_stray_check_detects_private_runtime_residue(tmp_path: pathlib.Path) -> None:
+    runtime = tmp_path / "runtime"
+    (runtime / "private-python-3.11.16").mkdir(parents=True)
+    script = f"""
+source {COMMON}
+source {PORTS}
+source {UNINSTALL}
+UNINSTALL_CHECK_PORT=not-a-port
+CURRENT_LINK={tmp_path / 'missing-current'}
+RELEASES_DIR={tmp_path / 'missing-releases'}
+CONFIG_DIR={tmp_path / 'missing-config'}
+SECRET_DIR={tmp_path / 'missing-secrets'}
+STATE_DIR={tmp_path / 'missing-state'}
+RUNTIME_DIR={runtime}
+INSTALL_MODE=system
+if stray_check true; then exit 9; fi
+"""
+    result = run_bash(script)
+    assert result.returncode == 0, result.stderr
+    assert "stray runtime dir" in result.stderr

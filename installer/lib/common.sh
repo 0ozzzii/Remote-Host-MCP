@@ -33,6 +33,71 @@ id() {
   command id "$@"
 }
 
+# Installer/runtime dependencies require Python >= 3.10. Some small/container
+# images put an older python3 earlier in PATH while a supported system Python is
+# also installed (for example /usr/bin/python3). Select one compatible external
+# interpreter once, then route all installer-time `python3` calls through it.
+# This avoids both raw AssertionError tracebacks and inconsistent interpreter
+# use between preflight, venv creation, port probes and certificate helpers.
+RHMCP_PYTHON_BIN="${RHMCP_PYTHON_BIN:-}"
+
+_rhmcp_external_command() {
+  local name="$1"
+  if [[ "$name" == */* ]]; then
+    [[ -x "$name" ]] && printf '%s\n' "$name"
+  else
+    type -P "$name" 2>/dev/null || true
+  fi
+}
+
+_rhmcp_python_supported() {
+  local candidate="$1"
+  command "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1
+}
+
+select_python_interpreter() {
+  local requested="${RHMCP_PYTHON_BIN:-}" candidate resolved seen='|'
+  local -a candidates=()
+
+  if [[ -n "$requested" ]]; then
+    resolved="$(_rhmcp_external_command "$requested")"
+    if [[ -n "$resolved" ]] && _rhmcp_python_supported "$resolved"; then
+      RHMCP_PYTHON_BIN="$resolved"
+      export RHMCP_PYTHON_BIN
+      return 0
+    fi
+    fail "Configured RHMCP_PYTHON_BIN is unavailable or older than Python 3.10: $requested"
+    return 1
+  fi
+
+  if [[ -n "${RHMCP_PYTHON_CANDIDATES:-}" ]]; then
+    IFS=':' read -r -a candidates <<< "$RHMCP_PYTHON_CANDIDATES"
+  else
+    candidates=(python3 /usr/bin/python3 /usr/local/bin/python3 python3.14 python3.13 python3.12 python3.11 python3.10)
+  fi
+
+  for candidate in "${candidates[@]}"; do
+    [[ -n "$candidate" ]] || continue
+    resolved="$(_rhmcp_external_command "$candidate")"
+    [[ -n "$resolved" ]] || continue
+    [[ "$seen" != *"|$resolved|"* ]] || continue
+    seen+="$resolved|"
+    if _rhmcp_python_supported "$resolved"; then
+      RHMCP_PYTHON_BIN="$resolved"
+      export RHMCP_PYTHON_BIN
+      return 0
+    fi
+  done
+  return 1
+}
+
+python3() {
+  local bin="${RHMCP_PYTHON_BIN:-}"
+  if [[ -z "$bin" ]]; then bin="$(type -P python3 2>/dev/null || true)"; fi
+  [[ -n "$bin" ]] || { printf 'python3: command not found\n' >&2; return 127; }
+  command "$bin" "$@"
+}
+
 confirm() {
   local prompt="${1:-$(t confirm)}" answer
   read -r -p "$prompt [y/N]: " answer || true
@@ -54,11 +119,16 @@ PY
 }
 
 require_python() {
-  command_exists python3 || die 'python3 is required / 需要 python3'
-  python3 - <<'PY' >/dev/null
-import sys
-assert sys.version_info >= (3, 10), sys.version
-PY
+  local default_bin default_version='not found'
+  default_bin="$(type -P python3 2>/dev/null || true)"
+  if [[ -n "$default_bin" ]]; then default_version="$(command "$default_bin" --version 2>&1 || true)"; fi
+
+  if select_python_interpreter; then return 0; fi
+
+  fail 'System environment check failed: Remote Host MCP requires Python >= 3.10. / 系统环境检测失败：Remote Host MCP 需要 Python >= 3.10。'
+  fail "Detected default python3: ${default_version:-unknown} / 当前默认 python3：${default_version:-unknown}"
+  printf '%s\n' 'NEXT / 下一步: install a Python 3.10+ interpreter with venv/ensurepip, or set RHMCP_PYTHON_BIN=/absolute/path/to/python3.x and rerun the same Installer.' >&2
+  return 1
 }
 
 python_venv_preflight() {

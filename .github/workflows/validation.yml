@@ -61,10 +61,10 @@ jobs:
           import importlib.metadata
           from remote_host_mcp import __version__
           from dsw_direct_mcp import __version__ as legacy_version
-          assert __version__ == "0.2.0a3"
+          assert __version__ == "0.2.0a4"
           assert legacy_version == __version__
           assert importlib.metadata.version("remote-host-mcp") == __version__
-          assert open("VERSION", encoding="utf-8").read().strip() == "0.2.0-alpha.3"
+          assert open("VERSION", encoding="utf-8").read().strip() == "0.2.0-alpha.4"
           assert callable(importlib.import_module("remote_host_mcp.main").main)
           assert callable(importlib.import_module("remote_host_mcp.app").build_server)
           assert callable(importlib.import_module("remote_host_mcp.host_server").main)
@@ -109,7 +109,7 @@ jobs:
       - name: Compile Python
         run: python -m compileall -q src tests
 
-      - name: Modern MCP wire, branding, Tasks and 48-tool surface
+      - name: Modern MCP wire, branding, Tasks and 65-tool surface
         env:
           RHMCP_AUTH_MODE: capability
           RHMCP_PATH_KEY: rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr
@@ -137,7 +137,7 @@ jobs:
           data=json.load(open(sys.argv[1], encoding="utf-8"))
           assert data["ok"] is True
           assert data["service"] == "Remote Host MCP"
-          assert data["version"] == "0.2.0a3"
+          assert data["version"] == "0.2.0a4"
           PY
 
           cat > "$RUNNER_TEMP/inspector.json" <<'JSON'
@@ -148,12 +148,30 @@ jobs:
           import json, sys
           data=json.load(open(sys.argv[1], encoding="utf-8")); result=data.get("result", data); tools=result.get("tools") or []
           names={t.get("name") for t in tools}
-          required={"status","system_info","job_run","job_start","terminal_open","process_info","process_signal","upload_begin","service_action","file_artifact","ssh_check","ssh_exec","ssh_upload","ssh_download"}
-          assert len(tools) == 48, len(tools)
+          required={
+              "status","system_info","job_run","job_start","terminal_open","process_info","process_signal","upload_begin","service_action",
+              "file_artifact","ssh_check","ssh_exec","ssh_upload","ssh_download",
+              "host_capabilities","wait_condition","artifact_info","artifact_preview","artifact_bundle","exec_argv",
+              "snapshot_create","snapshot_list","snapshot_restore","snapshot_delete",
+              "lease_acquire","lease_status","lease_list","lease_release","inspect_paths","file_diff","apply_patch"
+          }
+          assert len(tools) == 65, len(tools)
           assert not (required-names), sorted(required-names)
           visible=json.dumps(tools, ensure_ascii=False)
           for forbidden in ("DSW Direct Control","ModelScope DSW","DSW_MCP_","DSWD"):
               assert forbidden not in visible, forbidden
+          PY
+
+          npx -y @modelcontextprotocol/inspector@2.6.0 --cli --config "$RUNNER_TEMP/inspector.json" --server rhmcp --method tools/call --tool-name host_capabilities --tool-args-json '{}' --format json | tee "$RUNNER_TEMP/host-capabilities.json"
+          python - "$RUNNER_TEMP/host-capabilities.json" <<'PY'
+          import json, sys
+          data=json.load(open(sys.argv[1], encoding="utf-8")); result=data.get("result", data)
+          structured=result.get("structuredContent") or result.get("structured_content") or {}
+          assert structured.get("structured_argv_exec") is True
+          assert structured.get("snapshots") is True
+          assert structured.get("leases") is True
+          assert structured.get("bounded_batch_inspect") is True
+          assert structured.get("structured_patch") is True
           PY
 
           npx -y @modelcontextprotocol/inspector@2.6.0 --cli --config "$RUNNER_TEMP/inspector.json" --server rhmcp --method tools/call --tool-name system_info --tool-args-json '{}' --format json | tee "$RUNNER_TEMP/system-info.json"
@@ -164,7 +182,7 @@ jobs:
           assert structured.get("hostname")
           info=(result.get("_meta") or {}).get("io.modelcontextprotocol/serverInfo") or {}
           assert info.get("name") == "Remote Host MCP"
-          assert info.get("version") == "0.2.0a3"
+          assert info.get("version") == "0.2.0a4"
           PY
 
           npx -y @modelcontextprotocol/inspector@2.6.0 --cli --config "$RUNNER_TEMP/inspector.json" --server rhmcp --method tools/call --tool-name status --tool-args-json '{}' --format json | tee "$RUNNER_TEMP/status.json"
@@ -173,13 +191,13 @@ jobs:
           data=json.load(open(sys.argv[1], encoding="utf-8")); result=data.get("result", data)
           structured=result.get("structuredContent") or result.get("structured_content") or {}
           assert structured.get("service") == "Remote Host MCP"
-          assert structured.get("version") == "0.2.0a3"
+          assert structured.get("version") == "0.2.0a4"
           PY
 
           curl -fsS -X POST 'http://127.0.0.1:8765/mcp/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr' \
             -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
             -H 'MCP-Protocol-Version: 2026-07-28' -H 'Mcp-Method: tools/call' -H 'Mcp-Name: job_run' \
-            --data '{"jsonrpc":"2.0","id":88,"method":"tools/call","params":{"name":"job_run","arguments":{"command":"printf rhmcp-task-wire-ok","idempotency_key":"ci-rhmcp-alpha3-task"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{"extensions":{"io.modelcontextprotocol/tasks":{}}},"io.modelcontextprotocol/clientInfo":{"name":"rhmcp-ci","version":"1"}}}}' | tee "$RUNNER_TEMP/task-create.json"
+            --data '{"jsonrpc":"2.0","id":88,"method":"tools/call","params":{"name":"job_run","arguments":{"command":"printf rhmcp-task-wire-ok","idempotency_key":"ci-rhmcp-alpha4-task"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{"extensions":{"io.modelcontextprotocol/tasks":{}}},"io.modelcontextprotocol/clientInfo":{"name":"rhmcp-ci","version":"1"}}}}' | tee "$RUNNER_TEMP/task-create.json"
           task_id=$(python - "$RUNNER_TEMP/task-create.json" <<'PY'
           import json, sys
           result=json.load(open(sys.argv[1], encoding="utf-8"))["result"]
@@ -215,7 +233,7 @@ jobs:
           assert json.load(open(sys.argv[1], encoding="utf-8"))["error"]["code"] == -32020
           PY
 
-      - name: Static destructive and secret hygiene
+      - name: Static destructive, Agent-safety and secret hygiene
         run: |
           set -euo pipefail
           ! grep -R --include='*.py' --exclude-dir='*.egg-info' -n -E 'pkill[[:space:]]+-f' src/remote_host_mcp
@@ -223,6 +241,17 @@ jobs:
           ! grep -R --include='*.sh' -n -E '(^|[[:space:]])eval([[:space:]]|$)' installer
           ! grep -R --include='*.py' --exclude-dir='*.egg-info' -n -E 'print\(.*(DSW_MCP|RHMCP)_PATH_KEY|logger\..*command[^_a-zA-Z].*=' src/remote_host_mcp
           ! grep -R --include='*.py' --exclude-dir='*.egg-info' -n -E 'sshpass|StrictHostKeyChecking=no|PasswordAuthentication=yes|KbdInteractiveAuthentication=yes' src/remote_host_mcp
+          ! grep -R --include='*.py' -n -E 'shell[[:space:]]*=[[:space:]]*True|/proc/.*/environ' src/remote_host_mcp/agent_ops.py src/remote_host_mcp/agent_surface.py
+          python - <<'PY'
+          import json
+          tools=json.load(open('tests/tool_manifest.json', encoding='utf-8'))
+          assert len(tools) == len(set(tools)) == 65
+          required={'host_capabilities','wait_condition','artifact_info','artifact_preview','artifact_bundle','exec_argv','snapshot_create','snapshot_list','snapshot_restore','snapshot_delete','lease_acquire','lease_status','lease_list','lease_release','inspect_paths','file_diff','apply_patch'}
+          assert not (required-set(tools)), sorted(required-set(tools))
+          PY
+          test ! -e scripts/apply_agent_ops_surface.py
+          test ! -e .github/workflows/agent-native-ops-apply.yml
+          test ! -e .github/workflows/alpha3-feature-apply.yml
           echo 'Remote Host MCP static checks passed.'
 
       - name: Upload validation diagnostics
@@ -235,6 +264,7 @@ jobs:
             ${{ runner.temp }}/rhmcp.log
             ${{ runner.temp }}/health.json
             ${{ runner.temp }}/tools.json
+            ${{ runner.temp }}/host-capabilities.json
             ${{ runner.temp }}/system-info.json
             ${{ runner.temp }}/status.json
             ${{ runner.temp }}/task-create.json

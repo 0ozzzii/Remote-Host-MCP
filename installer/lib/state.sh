@@ -55,6 +55,11 @@ write_progress_state() {
   } > "$tmp"
   chmod 600 "$tmp"
   mv "$tmp" "$PROGRESS_STATE"
+  if [[ "$status" == COMPLETE && "$stage" == COMPLETE ]]; then
+    # Runtime secrets stay only in the protected runtime env; completion output is redacted.
+    if [[ -n "${PATH_KEY:-}" ]]; then PATH_KEY='<redacted>'; fi
+    unset RHMCP_VALIDATION_BEARER_TOKEN 2>/dev/null || true
+  fi
 }
 
 load_progress_state() {

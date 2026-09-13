@@ -9,7 +9,9 @@ import socket, sys
 p=int(sys.argv[1])
 s=socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 try:
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+    # Match normal asyncio/HTTP server restart semantics: SO_REUSEADDR permits
+    # rebinding after a clean shutdown while an active listener still fails.
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(('127.0.0.1', p))
 except OSError:
     raise SystemExit(1)

@@ -34,10 +34,36 @@ else
   load_locale "${RHMCP_LANGUAGE:-en_US}"
 fi
 
+usage() {
+  cat <<'EOF'
+Usage: rmcp [command]
+
+Interactive:
+  rmcp                              Open the bilingual management menu
+
+Read-only commands:
+  rmcp --version                    Show Remote Host MCP version
+  rmcp --root                       Show active release root
+  rmcp status                       Show service status
+  rmcp connection                   Show connection information with capability secret redacted
+  rmcp connection --show-secret     Explicitly show the full capability key/URL
+  rmcp logs [LINES]                 Show recent portable-service logs
+  rmcp check                        Run diagnostics/health checks
+  rmcp update-check                 Check the configured update channel
+
+Lifecycle commands:
+  rmcp start
+  rmcp stop
+  rmcp restart
+
+The capability URL is a credential. Use --show-secret only when you intend to copy it.
+EOF
+}
+
 case "${1:-}" in
   --root) printf '%s\n' "$ROOT"; exit 0 ;;
   --version|-V) printf 'Remote Host MCP %s\n' "$VERSION"; exit 0 ;;
-  --help|-h) printf 'Usage: rmcp [--root|--version|--help]\n'; exit 0 ;;
+  --help|-h) usage; exit 0 ;;
 esac
 
 pause_menu() { printf '\n'; read -r -p "$(t press_enter)" _ || true; }
@@ -60,6 +86,7 @@ service_action() {
 }
 
 show_connection() {
+  local reveal="${1:-}"
   load_env || die 'Missing configuration / 缺少配置'
   local host key auth port
   host="$(mcp_env_value PUBLIC_HOST 2>/dev/null || true)"
@@ -76,9 +103,15 @@ show_connection() {
   else
     [[ -n "$key" ]] || { warn 'Capability key is missing / 私密连接密钥缺失'; return 1; }
     printf 'Auth / 认证        : private capability URL\n'
-    printf 'MCP Path Key       : %s\n' "$key"
-    printf 'MCP URL            : https://%s/mcp/%s\n' "$host" "$key"
-    warn 'The URL contains a credential. Treat it like a password. / 完整 URL 含访问密钥，请像密码一样保存。'
+    if [[ "$reveal" == '--show-secret' ]]; then
+      printf 'MCP Path Key       : %s\n' "$key"
+      printf 'MCP URL            : https://%s/mcp/%s\n' "$host" "$key"
+      warn 'The URL contains a credential. Treat it like a password. / 完整 URL 含访问密钥，请像密码一样保存。'
+    else
+      printf 'MCP Path Key       : [REDACTED]\n'
+      printf 'MCP URL            : https://%s/mcp/[REDACTED]\n' "$host"
+      printf 'Reveal / 显示完整值 : rmcp connection --show-secret\n'
+    fi
   fi
 }
 
@@ -96,7 +129,7 @@ PY
   set_mcp_env_value PATH_KEY "$new"
   if service_action restart >/dev/null && bash scripts/manage.sh check >/dev/null 2>&1; then
     ok 'Key rotated / 密钥已重置'
-    show_connection
+    show_connection --show-secret
   else
     restore_file "$backup" .env
     service_action restart >/dev/null 2>&1 || true
@@ -134,6 +167,40 @@ PY
   fi
 }
 
+run_noninteractive() {
+  local command="${1:-}"
+  case "$command" in
+    connection)
+      case "${2:-}" in
+        '') show_connection ;;
+        --show-secret) show_connection --show-secret ;;
+        *) die 'Usage: rmcp connection [--show-secret]' ;;
+      esac
+      ;;
+    status) service_status ;;
+    start|stop|restart) service_action "$command" ;;
+    check) bash scripts/manage.sh check ;;
+    update-check) check_update ;;
+    logs)
+      local lines="${2:-120}"
+      [[ "$lines" =~ ^[0-9]+$ ]] || die 'LINES must be an integer'
+      if [[ "${RHMCP_SERVICE_BACKEND:-portable}" == systemd ]] && command -v journalctl >/dev/null 2>&1; then
+        journalctl -u remote-host-mcp.service -n "$lines" --no-pager
+      else
+        bash scripts/manage.sh logs "$lines"
+      fi
+      ;;
+    '') return 1 ;;
+    *) die "Unknown command: $command. Run 'rmcp --help'." ;;
+  esac
+  return 0
+}
+
+if [[ $# -gt 0 ]]; then
+  run_noninteractive "$@"
+  exit $?
+fi
+
 while true; do
   clear 2>/dev/null || true
   header "Remote Host MCP $VERSION"
@@ -143,7 +210,7 @@ while true; do
   subhr
   if [[ "$RMCP_LANGUAGE" == zh_CN ]]; then
     cat <<'MENU'
-  1. 查看连接信息
+  1. 查看完整连接信息（含私密 URL）
   2. 启动服务
   3. 停止服务
   4. 重启服务
@@ -156,7 +223,7 @@ while true; do
 MENU
   else
     cat <<'MENU'
-  1. Show connection information
+  1. Show full connection information (includes private URL)
   2. Start service
   3. Stop service
   4. Restart service
@@ -171,7 +238,7 @@ MENU
   subhr
   read -r -p 'Select / 选择 [0-9]: ' choice
   case "$choice" in
-    1) show_connection; pause_menu ;;
+    1) show_connection --show-secret; pause_menu ;;
     2) service_action start; pause_menu ;;
     3) service_action stop; pause_menu ;;
     4) service_action restart; pause_menu ;;

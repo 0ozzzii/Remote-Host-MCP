@@ -55,6 +55,7 @@ from .system_helpers import (
     system_info as system_info_impl,
 )
 from .artifact_helpers import file_artifact as file_artifact_impl
+from .agent_surface import register_agent_ops
 from .ssh_helpers import (
     ssh_check as ssh_check_impl,
     ssh_download as ssh_download_impl,
@@ -403,6 +404,9 @@ def build_server(settings: Settings) -> MCPServer:
     ) -> SshTransferResult:
         """Check remote size/hash, SCP to private staging, verify SHA-256, then publish inside allowed roots."""
         return await ssh_download_impl(host, user, port, remote_path, local_path, connect_timeout_seconds, timeout_ms, overwrite, mode, settings)
+
+    # ------------------------- Agent-native planning / safety -------------------------
+    register_agent_ops(mcp, settings)
 
     # ------------------------- Process / service / system -------------------------
     @mcp.tool(

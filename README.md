@@ -4,7 +4,7 @@ Remote Host MCP is a general-purpose MCP server for AI-controlled remote Linux h
 
 ## Current development line
 
-**Version: `0.2.0-alpha.3`** (`0.2.0a3` in Python packaging)
+**Version: `0.2.0-alpha.4`** (`0.2.0a4` in Python packaging)
 
 The validated `0.1.0-alpha.1` runtime established the independent repository and 43-tool MCP baseline. The `0.2.0-alpha.1` line productizes installation and lifecycle management without redesigning that runtime surface.
 
@@ -49,6 +49,11 @@ See `docs/INSTALLER_ARCHITECTURE.md` for design and safety boundaries.
 - filesystem tools with hardened path handling
 - chunked/resumable upload and download primitives
 - direct MCP image/binary artifact return for small allowed files
+- artifact metadata/preview/bounded ZIP bundling for Agent result handoff
+- Agent capability discovery and bounded condition waits
+- shell-free structured argv execution with minimal non-secret environment inheritance
+- scoped persistent rollback snapshots and TTL coordination leases
+- bounded multi-path inspection plus SHA-guarded structured text patching
 - strict preconfigured OpenSSH command and SCP transfer tools
 - process inspection and signaling
 - service/system inspection and control primitives

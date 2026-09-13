@@ -104,7 +104,7 @@ async def test_ssh_exec_uses_strict_noninteractive_options_and_stdin_not_argv(
 
 
 @pytest.mark.asyncio
-async def test_canonical_surface_has_48_tools_and_no_ssh_credential_arguments(
+async def test_canonical_surface_has_65_tools_and_no_ssh_credential_arguments(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     cfg = settings(monkeypatch, tmp_path)
@@ -113,7 +113,7 @@ async def test_canonical_surface_has_48_tools_and_no_ssh_credential_arguments(
         listed = await client.list_tools()
     tools = {tool.name: tool for tool in listed.tools}
     assert sorted(tools) == sorted(expected)
-    assert len(tools) == 48
+    assert len(tools) == 65
     for name in ("file_artifact", "ssh_check", "ssh_exec", "ssh_upload", "ssh_download"):
         assert name in tools
     forbidden = {"password", "private_key", "identity_file", "known_hosts", "known_hosts_file", "xauthority"}

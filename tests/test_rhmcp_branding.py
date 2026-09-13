@@ -41,7 +41,7 @@ async def test_canonical_app_has_generic_identity_and_tool_copy(
         listed = await client.list_tools()
         status = await client.call_tool("status", {})
 
-    assert len(listed.tools) == 48
+    assert len(listed.tools) == 65
     visible = _model_visible_text(
         [
             {

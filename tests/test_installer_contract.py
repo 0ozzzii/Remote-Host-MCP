@@ -42,6 +42,16 @@ def test_cloudflare_paste_is_parsed_never_evaled() -> None:
     assert not re.search(r"(^|\s)eval(\s|$)", cf)
 
 
+def test_cloudflare_download_is_version_and_checksum_pinned() -> None:
+    cf = text("installer/lib/cloudflare.sh")
+    assert "CLOUDFLARED_PINNED_VERSION='2026.9.1'" in cf
+    assert "CLOUDFLARED_LINUX_AMD64_SHA256=" in cf
+    assert "CLOUDFLARED_LINUX_ARM64_SHA256=" in cf
+    assert "sha256sum" in cf
+    assert "releases/latest/download" not in cf
+    assert "install_pinned_cloudflared" in text("scripts/setup-cft.sh")
+
+
 def test_no_noauth_installer_option() -> None:
     install = text("installer/install.sh")
     assert "AUTH_MODE=capability" in install
@@ -49,12 +59,31 @@ def test_no_noauth_installer_option() -> None:
     assert "AUTH_MODE=none" not in install
 
 
-def test_rmcp_exposes_update_and_key_rotation() -> None:
+def test_rmcp_exposes_update_rotation_and_redacted_connection_mode() -> None:
     menu = text("scripts/rmcp.sh")
     assert "check_update" in menu
     assert "rotate_key" in menu
     assert "Change language" in menu
     assert "修改语言" in menu
+    assert "connection" in menu
+    assert "[REDACTED]" in menu
+
+
+def test_remote_bootstrap_supports_digest_and_safe_archive_paths() -> None:
+    bootstrap = text("install.sh")
+    assert "RHMCP_SOURCE_SHA256" in bootstrap
+    assert "sha256sum" in bootstrap
+    assert "Unsafe path detected in source archive" in bootstrap
+    assert "--no-same-owner" in bootstrap
+
+
+def test_release_banners_come_from_version_file() -> None:
+    lib = text("scripts/lib.sh")
+    cft = text("scripts/setup-cft.sh")
+    assert "Remote Host MCP 0.1.0-alpha.1" not in lib
+    assert "Remote Host MCP 0.1.0-alpha.1" not in cft
+    assert "rmcp_version" in lib
+    assert 'VERSION="$(tr -d' in cft
 
 
 def test_direct_ingress_does_not_silently_replace_existing_proxy() -> None:

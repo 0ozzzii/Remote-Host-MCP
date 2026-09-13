@@ -37,6 +37,18 @@ source "$LIB_ROOT/lib/lifecycle.sh"
 # shellcheck disable=SC1091
 source "$LIB_ROOT/lib/external_probe.sh"
 # shellcheck disable=SC1091
+source "$LIB_ROOT/lib/cloudflare.sh"
+# shellcheck disable=SC1091
+source "$LIB_ROOT/lib/dns_provider.sh"
+# shellcheck disable=SC1091
+source "$LIB_ROOT/lib/reverse_proxy.sh"
+# shellcheck disable=SC1091
+source "$LIB_ROOT/lib/tls.sh"
+# shellcheck disable=SC1091
+source "$LIB_ROOT/lib/port_hardening.sh"
+# shellcheck disable=SC1091
+source "$LIB_ROOT/lib/configure.sh"
+# shellcheck disable=SC1091
 source "$LIB_ROOT/lib/uninstall.sh"
 # shellcheck disable=SC1091
 source "$LIB_ROOT/lib/update.sh"
@@ -47,6 +59,9 @@ VERSION="$(tr -d '\r\n' < "$ROOT/VERSION" 2>/dev/null || printf 'unknown')"
 if [[ -n "$STATE_FILE" && -f "$STATE_FILE" ]]; then
   load_install_layout_from_state "$STATE_FILE" || die 'Install state contains an unsafe or invalid layout.'
   load_locale "${RHMCP_LANGUAGE:-en_US}"
+  HTTPS_LISTEN_PORT="$(get_env_value RHMCP_HTTPS_LISTEN_PORT 2>/dev/null || printf '%s' "${RHMCP_PUBLIC_HTTPS_PORT:-443}")"
+  DOMAIN_CHALLENGE_MODE="$(get_env_value RHMCP_DOMAIN_CHALLENGE_MODE 2>/dev/null || printf 'auto')"
+  export HTTPS_LISTEN_PORT DOMAIN_CHALLENGE_MODE
 else
   load_locale "${RHMCP_LANGUAGE:-en_US}"
 fi
@@ -62,6 +77,7 @@ Lifecycle commands:
   restart                   Restart Remote Host MCP and verify bounded readiness
   repair                    Repair the local lifecycle without replacing healthy shared resources
   resume                    Resume an INCOMPLETE installer transaction at the same commit
+  configure                 Open configuration menu; change HTTPS public/listen ports without reinstalling
   uninstall --dry-run       Show exactly what owned resources would be removed
   uninstall                 Remove application/runtime/service/CLI, preserve recovery config/secrets/backups
   uninstall --purge         Remove the entire Remote Host MCP-owned namespace after confirmation
@@ -105,10 +121,11 @@ redact_stream() {
 
 status_cmd() {
   require_state
-  local port host https_port current cert_file cert_expiry='n/a' timer='n/a'
+  local port host https_port listen_port current cert_file cert_expiry='n/a' timer='n/a'
   port="${RHMCP_LOCAL_PORT:-8765}"
   host="${RHMCP_PUBLIC_HOST_STATE:-mcp.invalid}"
-  https_port="${RHMCP_PUBLIC_HTTPS_PORT:-443}"
+  https_port="$(get_env_value RHMCP_PUBLIC_HTTPS_PORT 2>/dev/null || printf '%s' "${RHMCP_PUBLIC_HTTPS_PORT:-443}")"
+  listen_port="$(get_env_value RHMCP_HTTPS_LISTEN_PORT 2>/dev/null || printf '%s' "$https_port")"
   current="$(readlink -f "$CURRENT_LINK" 2>/dev/null || printf 'missing')"
   cert_file="$(get_env_value RHMCP_CERT_FULLCHAIN 2>/dev/null || true)"
   if [[ -n "$cert_file" && -r "$cert_file" ]] && command -v openssl >/dev/null 2>&1; then
@@ -127,6 +144,7 @@ status_cmd() {
   printf 'Ingress              : %s\n' "${RHMCP_INGRESS:-unknown}"
   if [[ "${RHMCP_INGRESS:-private}" != private ]]; then
     printf 'Public endpoint      : https://%s%s\n' "$host" "$([[ "$https_port" == 443 ]] && printf '' || printf ':%s' "$https_port")"
+    if [[ "${RHMCP_INGRESS:-}" == domain || "${RHMCP_INGRESS:-}" == public-ip ]]; then printf 'HTTPS local listen   : %s\n' "$listen_port"; fi
   fi
   printf 'Certificate expiry   : %s\n' "$cert_expiry"
   printf 'Renewal timer        : %s\n' "$timer"
@@ -137,7 +155,7 @@ _mcp_validation_url() {
   local port host https_port auth key base
   port="$(mcp_env_value PORT 2>/dev/null || printf '8765')"
   host="${RHMCP_PUBLIC_HOST_STATE:-$(mcp_env_value PUBLIC_HOST 2>/dev/null || true)}"
-  https_port="${RHMCP_PUBLIC_HTTPS_PORT:-443}"
+  https_port="$(get_env_value RHMCP_PUBLIC_HTTPS_PORT 2>/dev/null || printf '%s' "${RHMCP_PUBLIC_HTTPS_PORT:-443}")"
   auth="$(mcp_env_value AUTH_MODE 2>/dev/null || printf 'capability')"
   if [[ "${RHMCP_INGRESS:-private}" == private ]]; then base="http://127.0.0.1:${port}"; else
     if [[ "$https_port" == 443 ]]; then base="https://${host}"; else base="https://${host}:${https_port}"; fi
@@ -159,7 +177,8 @@ doctor_cmd() {
   if wait_local_health "$port" 3 1; then ok 'local health'; else fail 'local health'; failures=$((failures+1)); fi
 
   if [[ "${RHMCP_INGRESS:-private}" != private ]]; then
-    local host="${RHMCP_PUBLIC_HOST_STATE:-}" https_port="${RHMCP_PUBLIC_HTTPS_PORT:-443}" health_url
+    local host="${RHMCP_PUBLIC_HOST_STATE:-}" https_port health_url
+    https_port="$(get_env_value RHMCP_PUBLIC_HTTPS_PORT 2>/dev/null || printf '%s' "${RHMCP_PUBLIC_HTTPS_PORT:-443}")"
     if [[ "$https_port" == 443 ]]; then health_url="https://${host}/health"; else health_url="https://${host}:${https_port}/health"; fi
     set +e; external_http_probe "$health_url" 200; rc=$?; set -e
     if [[ $rc -eq 0 ]]; then ok 'external HTTPS health'; else fail "external HTTPS health (${EXTERNAL_PROBE_BLOCK_HINT:-probe failed})"; failures=$((failures+1)); fi
@@ -183,7 +202,7 @@ doctor_cmd() {
         "$CURRENT_LINK/.venv/bin/python" "$ROOT/installer/validate_mcp.py" >/dev/null
       rc=$?
       set -e
-      if [[ $rc -eq 0 ]]; then ok 'MCP initialize/tools-list/host_capabilities'; else fail 'MCP protocol gate'; failures=$((failures+1)); fi
+      if [[ $rc -eq 0 ]]; then ok 'MCP server/discover + tools/list + host_capabilities'; else fail 'MCP protocol gate'; failures=$((failures+1)); fi
     fi
   else
     fail 'could not construct MCP validation endpoint'; failures=$((failures+1))
@@ -233,6 +252,11 @@ resume_cmd() {
   exec bash "$ROOT/installer/install.sh" --resume
 }
 
+configure_cmd() {
+  require_state
+  configure_network_menu
+}
+
 uninstall_cmd() {
   require_state
   local purge=false dry=false arg
@@ -255,7 +279,7 @@ show_connection() {
   key="$(mcp_env_value PATH_KEY 2>/dev/null || true)"
   auth="$(mcp_env_value AUTH_MODE 2>/dev/null || printf 'capability')"
   port="$(mcp_env_value PORT 2>/dev/null || printf '8765')"
-  https_port="${RHMCP_PUBLIC_HTTPS_PORT:-443}"
+  https_port="$(get_env_value RHMCP_PUBLIC_HTTPS_PORT 2>/dev/null || printf '%s' "${RHMCP_PUBLIC_HTTPS_PORT:-443}")"
   header "Remote Host MCP $VERSION"
   printf 'Local / 本地       : http://127.0.0.1:%s\n' "$port"
   if [[ "${RHMCP_INGRESS:-private}" != private ]]; then printf 'Public host / 域名 : %s\n' "$host"; fi
@@ -289,12 +313,12 @@ interactive_menu() {
     printf 'Ingress / 接入: %s\n' "${RHMCP_INGRESS:-legacy/source}"
     subhr
     if [[ "$RMCP_LANGUAGE" == zh_CN ]]; then
-      printf '  1. 状态\n  2. 完整诊断\n  3. 查看连接信息\n  4. 重启服务\n  5. 查看日志\n  6. 修复\n  7. 检查更新\n  8. 卸载预览\n  0. 退出\n'
+      printf '  1. 状态\n  2. 完整诊断\n  3. 查看连接信息\n  4. 重启服务\n  5. 查看日志\n  6. 修复\n  7. 配置（端口/映射）\n  8. 检查更新\n  9. 卸载预览\n  0. 退出\n'
     else
-      printf '  1. Status\n  2. Doctor\n  3. Connection information\n  4. Restart service\n  5. Logs\n  6. Repair\n  7. Check update\n  8. Uninstall dry-run\n  0. Exit\n'
+      printf '  1. Status\n  2. Doctor\n  3. Connection information\n  4. Restart service\n  5. Logs\n  6. Repair\n  7. Configuration (ports/mapping)\n  8. Check update\n  9. Uninstall dry-run\n  0. Exit\n'
     fi
     subhr
-    read -r -p 'Select / 选择 [0-8]: ' choice
+    read -r -p 'Select / 选择 [0-9]: ' choice
     case "$choice" in
       1) status_cmd ;;
       2) doctor_cmd || true ;;
@@ -302,8 +326,9 @@ interactive_menu() {
       4) restart_cmd || true ;;
       5) logs_cmd 120 ;;
       6) repair_cmd ;;
-      7) check_update_cmd || true ;;
-      8) uninstall_plan false ;;
+      7) configure_cmd ;;
+      8) check_update_cmd || true ;;
+      9) uninstall_plan false ;;
       0) exit 0 ;;
       *) warn 'Invalid selection / 无效选项' ;;
     esac
@@ -321,6 +346,7 @@ case "${1:-}" in
   restart) restart_cmd ;;
   repair) repair_cmd ;;
   resume) resume_cmd ;;
+  configure) configure_cmd ;;
   uninstall) uninstall_cmd "$@" ;;
   stray-check)
     shift

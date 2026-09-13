@@ -13,15 +13,14 @@ URL = os.environ.get("RHMCP_VALIDATE_URL", "")
 BEARER = os.environ.get("RHMCP_VALIDATION_BEARER_TOKEN", "")
 CLIENT_INFO = {"name": "remote-host-mcp-installer", "version": "1"}
 CLIENT_CAPABILITIES: dict = {}
+SERVER_INFO_META_KEY = "io.modelcontextprotocol/serverInfo"
 
 if not URL.startswith(("http://127.0.0.1:", "https://")):
     raise SystemExit("validator URL is missing or unsafe")
 
-session_id: str | None = None
-
 
 def _request_meta() -> dict:
-    """Return the modern MCP envelope required by Remote Host MCP."""
+    """Return the per-request metadata required by MCP 2026-07-28."""
     return {
         "io.modelcontextprotocol/protocolVersion": PROTOCOL,
         "io.modelcontextprotocol/clientCapabilities": CLIENT_CAPABILITIES,
@@ -49,13 +48,10 @@ def _decode_body(raw: bytes) -> dict:
     return json.loads(data_lines[-1])
 
 
-def rpc(method: str, params: dict | None = None, *, request_id: int | None = 1, tool_name: str | None = None) -> dict:
-    global session_id
+def rpc(method: str, params: dict | None = None, *, request_id: int = 1, tool_name: str | None = None) -> dict:
     request_params = dict(params or {})
     request_params["_meta"] = _request_meta()
-    payload: dict = {"jsonrpc": "2.0", "method": method, "params": request_params}
-    if request_id is not None:
-        payload["id"] = request_id
+    payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": request_params}
     body = json.dumps(payload, separators=(",", ":")).encode()
     headers = {
         "Content-Type": "application/json",
@@ -67,17 +63,10 @@ def rpc(method: str, params: dict | None = None, *, request_id: int | None = 1, 
         headers["Mcp-Name"] = tool_name
     if BEARER:
         headers["Authorization"] = f"Bearer {BEARER}"
-    if session_id:
-        headers["Mcp-Session-Id"] = session_id
     req = urllib.request.Request(URL, data=body, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=15, context=ssl.create_default_context()) as resp:
-            new_session = resp.headers.get("Mcp-Session-Id")
-            if new_session:
-                session_id = new_session
             raw = resp.read()
-            if request_id is None:
-                return {}
             doc = _decode_body(raw)
     except urllib.error.HTTPError as exc:
         safe = _redact(exc.read(2048).decode("utf-8", errors="replace"))
@@ -87,24 +76,13 @@ def rpc(method: str, params: dict | None = None, *, request_id: int | None = 1, 
     return doc.get("result", {})
 
 
-init = rpc(
-    "initialize",
-    {
-        "protocolVersion": PROTOCOL,
-        "capabilities": CLIENT_CAPABILITIES,
-        "clientInfo": CLIENT_INFO,
-    },
-    request_id=1,
-)
-server_info = init.get("serverInfo") or {}
+discover = rpc("server/discover", {}, request_id=1)
+supported_versions = discover.get("supportedVersions") or []
+if PROTOCOL not in supported_versions:
+    raise SystemExit(f"server does not advertise {PROTOCOL}: {supported_versions!r}")
+server_info = (discover.get("_meta") or {}).get(SERVER_INFO_META_KEY) or {}
 if server_info.get("name") != "Remote Host MCP":
     raise SystemExit(f"unexpected serverInfo: {server_info!r}")
-
-try:
-    rpc("notifications/initialized", {}, request_id=None)
-except Exception:
-    # Stateless servers may not emit a response for notifications.
-    pass
 
 tools_result = rpc("tools/list", {}, request_id=2)
 tools = tools_result.get("tools") or []

@@ -75,8 +75,10 @@ start_portable_service_managed() {
 }
 
 install_rmcp_launcher() {
-  local wrapper target tmp
-  target="$CURRENT_LINK/scripts/rmcp.sh"
+  local wrapper release_root target tmp
+  release_root="${RELEASE_DIR:-$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)}"
+  [[ -n "$release_root" && -f "$release_root/scripts/rmcp.sh" ]] || die 'Cannot install rmcp launcher: controller release is unavailable.'
+  target="$release_root/scripts/rmcp.sh"
   if [[ $EUID -eq 0 && -d /usr/local/bin ]]; then
     wrapper=/usr/local/bin/rmcp
   else
@@ -96,6 +98,7 @@ EOF2
   chmod 755 "$tmp"
   mv -f "$tmp" "$wrapper"
   record_resource rmcp_cli "$wrapper" created
+  record_resource rmcp_controller "$target" created
   ok "rmcp -> $wrapper"
 }
 
@@ -123,6 +126,11 @@ restore_provenance_from_release() {
   upsert_env_value "$CONFIG_DIR/rhmcp.env" RHMCP_BUILD_REF "$ref"
 }
 
+_safe_install_path() {
+  local path="$1"
+  [[ -n "$path" && "$path" = /* && "$path" != / ]]
+}
+
 load_install_layout_from_state() {
   local state_file="$1"
   load_install_state "$state_file" || return 1
@@ -134,6 +142,7 @@ load_install_layout_from_state() {
   SECRET_DIR="${RHMCP_SECRET_DIR_PERSIST:-}"
   RUNTIME_DIR="${RHMCP_RUNTIME_DIR_PERSIST:-}"
   BACKUP_DIR="${RHMCP_BACKUP_DIR:-${STATE_DIR}/backups}"
+  for _p in "$CODE_BASE" "$CONFIG_DIR" "$STATE_DIR" "$LOG_DIR" "$SECRET_DIR" "$RUNTIME_DIR" "$BACKUP_DIR"; do _safe_install_path "$_p" || return 2; done
   RELEASES_DIR="${CODE_BASE}/releases"
   CURRENT_LINK="${CODE_BASE}/current"
   INSTALL_STATE="$state_file"

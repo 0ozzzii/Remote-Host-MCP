@@ -11,6 +11,7 @@ on:
       - "VERSION"
       - "tests/test_installer_contract.py"
       - "tests/test_installer_lifecycle.py"
+      - "tests/test_installer_repair.py"
       - ".github/workflows/installer-validation.yml"
   pull_request:
     paths:
@@ -21,6 +22,7 @@ on:
       - "VERSION"
       - "tests/test_installer_contract.py"
       - "tests/test_installer_lifecycle.py"
+      - "tests/test_installer_repair.py"
       - ".github/workflows/installer-validation.yml"
   workflow_dispatch:
 
@@ -49,10 +51,10 @@ jobs:
           bash -n scripts/rmcp.sh
           bash -n scripts/manage.sh
           find installer -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
-          python -m py_compile installer/validate_mcp.py tests/test_installer_contract.py tests/test_installer_lifecycle.py
+          python -m py_compile installer/validate_mcp.py tests/test_installer_contract.py tests/test_installer_lifecycle.py tests/test_installer_repair.py
 
       - name: Installer lifecycle tests
-        run: python -m pytest -q tests/test_installer_contract.py tests/test_installer_lifecycle.py
+        run: python -m pytest -q tests/test_installer_contract.py tests/test_installer_lifecycle.py tests/test_installer_repair.py
 
       - name: Occupied port fails closed
         run: |
@@ -129,7 +131,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Fresh install → real MCP → purge → reinstall → real MCP
+      - name: Fresh install → repair → resume → purge → reinstall → real MCP
         env:
           RHMCP_LANGUAGE: en_US
         run: |
@@ -137,13 +139,7 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           install_root="$RUNNER_TEMP/rhmcp-lifecycle"
 
-          install_once() {
-            printf '2\n%s\n2\n4\n1\n' "$install_root" | bash installer/install.sh | tee "$RUNNER_TEMP/install.log"
-            test -x "$install_root/current/.venv/bin/remote-host-mcp"
-            test -x "$HOME/.local/bin/rmcp"
-            curl -fsS http://127.0.0.1:8765/health > "$RUNNER_TEMP/health.json"
-            grep -q '/mcp/<redacted>' "$RUNNER_TEMP/install.log"
-            ! grep -q 'RHMCP_PATH_KEY=' "$RUNNER_TEMP/install.log"
+          assert_complete_identity() {
             python - "$install_root/config/install-state.env" "$EXPECTED_SHA" <<'PY'
           import pathlib, shlex, sys
           path=pathlib.Path(sys.argv[1]); expected=sys.argv[2].lower(); data={}
@@ -155,12 +151,49 @@ jobs:
           assert data['RHMCP_BUILD_REF'] not in ('', 'unknown')
           assert data['RHMCP_RELEASE_ID'] not in ('', 'unknown')
           PY
+          }
+
+          install_once() {
+            printf '2\n%s\n2\n4\n1\n' "$install_root" | bash installer/install.sh | tee "$RUNNER_TEMP/install.log"
+            test -x "$install_root/current/.venv/bin/remote-host-mcp"
+            test -x "$HOME/.local/bin/rmcp"
+            curl -fsS http://127.0.0.1:8765/health > "$RUNNER_TEMP/health.json"
+            grep -q '/mcp/<redacted>' "$RUNNER_TEMP/install.log"
+            ! grep -q 'RHMCP_PATH_KEY=' "$RUNNER_TEMP/install.log"
+            assert_complete_identity
             rmcp status
+            rmcp doctor
+            rmcp repair
             rmcp doctor
             rmcp uninstall --dry-run
           }
 
+          mark_resumable_public_ready() {
+            python - "$install_root/config/install-state.env" "$install_root/config/install-progress.env" <<'PY'
+          import pathlib, sys
+          state=pathlib.Path(sys.argv[1]); progress=pathlib.Path(sys.argv[2])
+          def replace(path, key, value):
+              lines=path.read_text().splitlines()
+              out=[]; seen=False
+              for line in lines:
+                  if line.startswith(key+'='):
+                      out.append(f'{key}={value}'); seen=True
+                  else:
+                      out.append(line)
+              if not seen: out.append(f'{key}={value}')
+              path.write_text('\n'.join(out)+'\n')
+          replace(state, 'RHMCP_INSTALL_STATUS', 'INCOMPLETE')
+          replace(progress, 'INSTALL_STATUS', 'INCOMPLETE')
+          replace(progress, 'LAST_COMPLETED_STAGE', 'PUBLIC_READY')
+          replace(progress, 'LAST_ERROR_CLASS', 'CI_RESUME_SIMULATION')
+          PY
+          }
+
           install_once
+          mark_resumable_public_ready
+          rmcp resume
+          assert_complete_identity
+          rmcp doctor
           RHMCP_ASSUME_YES=1 rmcp uninstall --purge
           test ! -e "$install_root"
           test ! -e "$HOME/.local/bin/rmcp"

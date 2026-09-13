@@ -35,8 +35,43 @@ write_release_metadata() {
   mv "$tmp" "$final"
 }
 
+_progress_stage_rank() {
+  case "$1" in
+    NONE) printf '0\n' ;;
+    PRECHECK) printf '10\n' ;;
+    PREPARE) printf '20\n' ;;
+    RELEASE) printf '30\n' ;;
+    RUNTIME) printf '40\n' ;;
+    CLI_RECOVERY) printf '50\n' ;;
+    SERVICE) printf '60\n' ;;
+    LOCAL_READY) printf '70\n' ;;
+    INGRESS) printf '80\n' ;;
+    TLS) printf '90\n' ;;
+    PUBLIC_READY) printf '100\n' ;;
+    MCP_VERIFY) printf '110\n' ;;
+    COMPLETE) printf '120\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+read_progress_completed_stage() {
+  local raw
+  [[ -f "$PROGRESS_STATE" ]] || return 1
+  raw="$(sed -n 's/^LAST_COMPLETED_STAGE=//p' "$PROGRESS_STATE" | head -n 1)"
+  _progress_stage_rank "$raw" >/dev/null || return 1
+  printf '%s\n' "$raw"
+}
+
 write_progress_state() {
-  local status="$1" stage="$2" error_class="${3:-}" tmp="$PROGRESS_STATE.tmp.$$"
+  local status="$1" requested_stage="$2" error_class="${3:-}" tmp="$PROGRESS_STATE.tmp.$$" stage existing_stage
+  stage="$requested_stage"
+  _progress_stage_rank "$stage" >/dev/null || return 2
+  if [[ "$status" == INCOMPLETE ]]; then
+    existing_stage="$(read_progress_completed_stage 2>/dev/null || true)"
+    if [[ -n "$existing_stage" ]] && (( $(_progress_stage_rank "$existing_stage") > $(_progress_stage_rank "$stage") )); then
+      stage="$existing_stage"
+    fi
+  fi
   umask 077
   {
     printf 'INSTALL_STATUS=%s\n' "$(state_escape "$status")"
@@ -58,7 +93,7 @@ write_progress_state() {
   } > "$tmp"
   chmod 600 "$tmp"
   mv "$tmp" "$PROGRESS_STATE"
-  LAST_COMPLETED_STAGE="$stage"
+  declare -g LAST_COMPLETED_STAGE="$stage"
   if [[ "$status" == COMPLETE && "$stage" == COMPLETE ]]; then
     if [[ -n "${PATH_KEY:-}" ]]; then PATH_KEY='<redacted>'; fi
     unset RHMCP_VALIDATION_BEARER_TOKEN 2>/dev/null || true
@@ -69,20 +104,6 @@ load_progress_state() {
   [[ -f "$PROGRESS_STATE" ]] || return 1
   # shellcheck disable=SC1090
   source "$PROGRESS_STATE"
-}
-
-read_progress_completed_stage() {
-  local raw
-  [[ -f "$PROGRESS_STATE" ]] || return 1
-  raw="$(sed -n 's/^LAST_COMPLETED_STAGE=//p' "$PROGRESS_STATE" | head -n 1)"
-  case "$raw" in
-    NONE|PRECHECK|PREPARE|RELEASE|RUNTIME|CLI_RECOVERY|SERVICE|LOCAL_READY|INGRESS|TLS|PUBLIC_READY|MCP_VERIFY|COMPLETE)
-      printf '%s\n' "$raw"
-      ;;
-    *)
-      return 1
-      ;;
-  esac
 }
 
 restore_transaction_state() {

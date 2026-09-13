@@ -119,9 +119,29 @@ redact_stream() {
     -e 's#(RHMCP_PATH_KEY=)[^[:space:]]+#\1<redacted>#g'
 }
 
+renewal_status_text() {
+  local backend pidfile loop
+  backend="$(get_env_value RHMCP_CERT_RENEW_BACKEND 2>/dev/null || true)"
+  case "$backend" in
+    systemd)
+      if command -v systemctl >/dev/null 2>&1; then
+        printf 'systemd/%s/%s\n' "$(systemctl is-enabled remote-host-mcp-cert-renew.timer 2>/dev/null || true)" "$(systemctl is-active remote-host-mcp-cert-renew.timer 2>/dev/null || true)"
+      else
+        printf 'systemd/unavailable\n'
+      fi
+      ;;
+    portable)
+      pidfile="$LOG_DIR/cert-renew.pid"; loop="$CERTBOT_DIR/renew-loop.sh"
+      if portable_renewal_alive "$pidfile" "$loop"; then printf 'portable/running\n'; else printf 'portable/stopped\n'; fi
+      ;;
+    '') printf 'n/a\n' ;;
+    *) printf '%s/unknown\n' "$backend" ;;
+  esac
+}
+
 status_cmd() {
   require_state
-  local port host https_port listen_port current cert_file cert_expiry='n/a' timer='n/a'
+  local port host https_port listen_port current cert_file cert_expiry='n/a' renewal='n/a'
   port="${RHMCP_LOCAL_PORT:-8765}"
   host="${RHMCP_PUBLIC_HOST_STATE:-mcp.invalid}"
   https_port="$(get_env_value RHMCP_PUBLIC_HTTPS_PORT 2>/dev/null || printf '%s' "${RHMCP_PUBLIC_HTTPS_PORT:-443}")"
@@ -131,9 +151,7 @@ status_cmd() {
   if [[ -n "$cert_file" && -r "$cert_file" ]] && command -v openssl >/dev/null 2>&1; then
     cert_expiry="$(openssl x509 -in "$cert_file" -noout -enddate 2>/dev/null | sed 's/^notAfter=//' || true)"
   fi
-  if [[ -n "$(resource_value cert_renew_timer PATH 2>/dev/null || true)" ]] && command -v systemctl >/dev/null 2>&1; then
-    timer="$(systemctl is-enabled remote-host-mcp-cert-renew.timer 2>/dev/null || true)/$(systemctl is-active remote-host-mcp-cert-renew.timer 2>/dev/null || true)"
-  fi
+  renewal="$(renewal_status_text)"
   header "Remote Host MCP ${RHMCP_INSTALL_VERSION:-$VERSION}"
   printf 'Install status       : %s\n' "${RHMCP_INSTALL_STATUS:-unknown}"
   printf 'Build commit         : %s\n' "${RHMCP_BUILD_COMMIT:-unknown}"
@@ -147,7 +165,7 @@ status_cmd() {
     if [[ "${RHMCP_INGRESS:-}" == domain || "${RHMCP_INGRESS:-}" == public-ip ]]; then printf 'HTTPS local listen   : %s\n' "$listen_port"; fi
   fi
   printf 'Certificate expiry   : %s\n' "$cert_expiry"
-  printf 'Renewal timer        : %s\n' "$timer"
+  printf 'Renewal backend      : %s\n' "$renewal"
 }
 
 _mcp_validation_url() {
@@ -170,7 +188,7 @@ _mcp_validation_url() {
 
 doctor_cmd() {
   require_state
-  local failures=0 port url rc cert_file bearer="${RHMCP_VALIDATION_BEARER_TOKEN:-}"
+  local failures=0 port url rc cert_file renew_backend bearer="${RHMCP_VALIDATION_BEARER_TOKEN:-}"
   port="${RHMCP_LOCAL_PORT:-8765}"
   header 'Remote Host MCP doctor'
   if [[ -L "$CURRENT_LINK" && -x "$CURRENT_LINK/.venv/bin/remote-host-mcp" ]]; then ok 'runtime/current release'; else fail 'runtime/current release missing'; failures=$((failures+1)); fi
@@ -208,9 +226,27 @@ doctor_cmd() {
     fail 'could not construct MCP validation endpoint'; failures=$((failures+1))
   fi
 
-  if [[ -n "$(resource_value cert_renew_timer PATH 2>/dev/null || true)" ]]; then
-    if command -v systemctl >/dev/null 2>&1 && systemctl is-enabled remote-host-mcp-cert-renew.timer >/dev/null 2>&1; then ok 'certificate renewal timer enabled'; else fail 'certificate renewal timer not enabled'; failures=$((failures+1)); fi
-  fi
+  renew_backend="$(get_env_value RHMCP_CERT_RENEW_BACKEND 2>/dev/null || true)"
+  case "$renew_backend" in
+    systemd)
+      if command -v systemctl >/dev/null 2>&1 && systemctl is-enabled remote-host-mcp-cert-renew.timer >/dev/null 2>&1 && systemctl is-active remote-host-mcp-cert-renew.timer >/dev/null 2>&1; then
+        ok 'certificate renewal backend: systemd timer enabled + active'
+      else
+        fail 'certificate renewal backend: systemd timer unhealthy'; failures=$((failures+1))
+      fi
+      ;;
+    portable)
+      if portable_renewal_alive "$LOG_DIR/cert-renew.pid" "$CERTBOT_DIR/renew-loop.sh"; then
+        ok 'certificate renewal backend: portable scheduler running'
+      else
+        fail 'certificate renewal backend: portable scheduler stopped/identity mismatch'; failures=$((failures+1))
+      fi
+      ;;
+    '')
+      if [[ -n "$cert_file" ]]; then fail 'certificate exists but renewal backend is not recorded'; failures=$((failures+1)); fi
+      ;;
+    *) fail "unknown certificate renewal backend: $renew_backend"; failures=$((failures+1)) ;;
+  esac
 
   if (( failures == 0 )); then ok 'doctor PASS'; return 0; fi
   fail "doctor found ${failures} failing layer(s)"

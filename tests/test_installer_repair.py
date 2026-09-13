@@ -52,10 +52,7 @@ def test_tunnel_repair_requires_existing_secret_and_external_health(tmp_path: pa
         PUBLIC_HOST=example.invalid
         install_managed_tunnel_service() {{ test "$1" = {token!s}; touch {marker!s}; }}
         external_http_probe() {{ return 42; }}
-        set +e
-        repair_ingress_lifecycle
-        rc=$?
-        set -e
+        if repair_ingress_lifecycle; then rc=0; else rc=$?; fi
         test "$rc" -eq 1
         test -f {marker!s}
         """
@@ -118,10 +115,7 @@ def test_domain_https_fails_closed_when_http01_and_dns01_are_unavailable(tmp_pat
         write_managed_nginx_http() {{ :; }}
         acme_external_http_preflight() {{ return 42; }}
         _cloudflare_dns01_available_or_prompt() {{ return 1; }}
-        set +e
-        configure_domain_https example.com ops@example.com other 443
-        rc=$?
-        set -e
+        if configure_domain_https example.com ops@example.com other 443; then rc=0; else rc=$?; fi
         test "$rc" -eq 1
         """
     )
@@ -143,10 +137,7 @@ def test_public_ip_https_never_falls_back_to_dns01(tmp_path: pathlib.Path) -> No
         acme_external_http_preflight() {{ return 42; }}
         issue_domain_dns01() {{ touch {marker!s}; }}
         issue_ip_http01() {{ return 88; }}
-        set +e
-        configure_public_ip_https 203.0.113.10 ops@example.com 443
-        rc=$?
-        set -e
+        if configure_public_ip_https 203.0.113.10 ops@example.com 443; then rc=0; else rc=$?; fi
         test "$rc" -eq 1
         test ! -e {marker!s}
         """

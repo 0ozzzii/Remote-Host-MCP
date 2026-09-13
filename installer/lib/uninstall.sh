@@ -63,10 +63,10 @@ _disable_owned_systemd_resource() {
 }
 
 _wait_port_release() {
-  local port="$1" tries="${2:-50}"
+  local port="$1" tries="${2:-50}" i
   [[ "$port" =~ ^[0-9]+$ ]] || return 2
   for ((i=0; i<tries; i++)); do
-    port_free "$port" && return 0
+    port_listening "$port" || return 0
     sleep 0.1
   done
   return 1
@@ -84,7 +84,7 @@ _stop_owned_services() {
       return 1
     fi
     if ! _wait_port_release "$port"; then
-      fail "Portable server did not release local port ${port}; refusing destructive cleanup."
+      fail "Portable server still accepts connections on local port ${port}; refusing destructive cleanup."
       return 1
     fi
   fi
@@ -203,8 +203,8 @@ stray_check() {
   _stray_path_absent 'stray Nginx enable link' "${UNINSTALL_CHECK_NGINX_LINK:-}" failures
   [[ -z "${CURRENT_LINK:-}" || ! -e "$CURRENT_LINK" ]] || { fail "stray current link: $CURRENT_LINK"; failures=$((failures+1)); }
   [[ -z "${RELEASES_DIR:-}" || ! -e "$RELEASES_DIR" ]] || { fail "stray releases dir: $RELEASES_DIR"; failures=$((failures+1)); }
-  if [[ "$port" =~ ^[0-9]+$ ]] && ! port_free "$port"; then
-    fail "local port still listening: $port"; failures=$((failures+1))
+  if [[ "$port" =~ ^[0-9]+$ ]] && port_listening "$port"; then
+    fail "local port still has a live listener: $port"; failures=$((failures+1))
   fi
   if [[ "$purge" == true ]]; then
     [[ ! -e "${CONFIG_DIR:-/nonexistent}" ]] || { fail "stray config dir: $CONFIG_DIR"; failures=$((failures+1)); }

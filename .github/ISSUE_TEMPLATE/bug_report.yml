@@ -1,0 +1,60 @@
+name: Bug report
+description: Report a reproducible Remote Host MCP problem
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please follow SECURITY.md for security-sensitive reports and redact private operational data from normal issues.
+  - type: input
+    id: version
+    attributes:
+      label: Remote Host MCP version
+      description: Version plus commit/tag if known.
+      placeholder: 0.2.0-alpha.4 / commit
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Linux distribution, Python version, installation layout, and service backend.
+    validations:
+      required: true
+  - type: input
+    id: area
+    attributes:
+      label: Affected tool or component
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted diagnostics
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Report check
+      options:
+        - label: I removed private operational data from this report.
+          required: true

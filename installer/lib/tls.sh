@@ -9,6 +9,7 @@ ACME_WEBROOT=''
 CERT_NAME=''
 CERT_FULLCHAIN=''
 CERT_PRIVKEY=''
+CERT_RENEWAL_MODE=''
 
 version_ge() {
   python3 - "$1" "$2" <<'PY'
@@ -17,6 +18,19 @@ def v(s):
     p=[int(x) for x in re.findall(r'\d+',s)[:3]]
     return tuple((p+[0,0,0])[:3])
 raise SystemExit(0 if v(sys.argv[1]) >= v(sys.argv[2]) else 1)
+PY
+}
+
+bind_port_free_any() {
+  local port="$1"
+  python3 - "$port" <<'PY' >/dev/null 2>&1
+import socket,sys
+p=int(sys.argv[1])
+s=socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    s.bind(('0.0.0.0', p))
+finally:
+    s.close()
 PY
 }
 
@@ -35,7 +49,7 @@ install_nginx_dependency() {
 }
 
 ensure_nginx_for_direct() {
-  local proxy answer
+  local proxy answer installed=false
   proxy="$(detect_proxy)"
   case "$proxy" in
     nginx) record_resource host_nginx "$(command -v nginx)" shared; return 0 ;;
@@ -43,6 +57,12 @@ ensure_nginx_for_direct() {
       die "Active ${proxy} detected. Automatic direct-HTTPS takeover is refused; use Cloudflare Tunnel/private mode or integrate manually."
       ;;
   esac
+
+  bind_port_free_any 80 || die 'TCP port 80 is already occupied by a non-Nginx listener; refusing managed HTTP-01 takeover.'
+  if [[ "${PUBLIC_HTTPS_PORT:-443}" != 80 ]]; then
+    bind_port_free_any "${PUBLIC_HTTPS_PORT:-443}" || die "TCP port ${PUBLIC_HTTPS_PORT:-443} is already occupied by a non-Nginx listener; refusing managed HTTPS takeover."
+  fi
+
   if ! command -v nginx >/dev/null 2>&1; then
     if [[ "${RHMCP_AUTO_INSTALL_DEPS:-0}" == 1 ]]; then
       install_nginx_dependency
@@ -51,8 +71,9 @@ ensure_nginx_for_direct() {
       [[ "$answer" =~ ^[Yy]$ ]] || die 'Nginx is required for managed direct HTTPS.'
       install_nginx_dependency
     fi
+    installed=true
   fi
-  record_resource host_nginx "$(command -v nginx)" shared
+  if [[ "$installed" == true ]]; then record_resource host_nginx "$(command -v nginx)" created; else record_resource host_nginx "$(command -v nginx)" shared; fi
   if systemd_operational; then
     systemctl enable --now nginx
   elif ! pgrep -x nginx >/dev/null 2>&1; then
@@ -63,9 +84,7 @@ ensure_nginx_for_direct() {
 ensure_product_certbot() {
   local venv="$RUNTIME_DIR/certbot-venv" version=''
   install -d -m 700 "$RUNTIME_DIR"
-  if [[ -x "$venv/bin/certbot" ]]; then
-    version="$($venv/bin/certbot --version 2>/dev/null | awk '{print $2}' || true)"
-  fi
+  if [[ -x "$venv/bin/certbot" ]]; then version="$($venv/bin/certbot --version 2>/dev/null | awk '{print $2}' || true)"; fi
   if [[ -z "$version" ]] || ! version_ge "$version" 5.4; then
     rm -rf -- "$venv"
     python3 -m venv "$venv"
@@ -187,10 +206,7 @@ acme_external_http_preflight() {
   marker="RHMCP_ACME_PROBE_$(python3 -c 'import secrets; print(secrets.token_hex(12))')"
   printf '%s\n' "$marker" > "$ACME_WEBROOT/.well-known/acme-challenge/$token"
   url="http://${host}/.well-known/acme-challenge/${token}"
-  set +e
-  external_http_probe "$url" 200
-  rc=$?
-  set -e
+  set +e; external_http_probe "$url" 200; rc=$?; set -e
   rm -f "$ACME_WEBROOT/.well-known/acme-challenge/$token"
   case "$rc" in
     0) ok "External HTTP-01 reachability PASS: $host"; return 0 ;;
@@ -205,6 +221,7 @@ issue_domain_dns01() {
   prepare_certbot_hooks cloudflare
   [[ -r "$(cloudflare_dns_token_file)" ]] || die 'Cloudflare DNS token is not configured for DNS-01.'
   CERT_NAME="remote-host-mcp-${host//./-}"
+  CERT_RENEWAL_MODE='dns-01-cloudflare'
   certbot_run certonly --non-interactive --agree-tos --email "$email" \
     --cert-name "$CERT_NAME" --manual --preferred-challenges dns \
     --manual-auth-hook "$CERTBOT_AUTH_HOOK" --manual-cleanup-hook "$CERTBOT_CLEANUP_HOOK" \
@@ -214,6 +231,7 @@ issue_domain_dns01() {
 issue_domain_http01() {
   local host="$1" email="$2"
   CERT_NAME="remote-host-mcp-${host//./-}"
+  CERT_RENEWAL_MODE='http-01-webroot'
   certbot_run certonly --non-interactive --agree-tos --email "$email" \
     --cert-name "$CERT_NAME" --webroot --webroot-path "$ACME_WEBROOT" -d "$host"
 }
@@ -221,6 +239,7 @@ issue_domain_http01() {
 issue_ip_http01() {
   local ip="$1" email="$2"
   CERT_NAME="remote-host-mcp-ip-${ip//./-}"
+  CERT_RENEWAL_MODE='http-01-webroot-shortlived-ip'
   certbot_run certonly --non-interactive --agree-tos --email "$email" \
     --cert-name "$CERT_NAME" --preferred-profile shortlived \
     --webroot --webroot-path "$ACME_WEBROOT" --ip-address "$ip"
@@ -231,7 +250,10 @@ set_certificate_paths() {
   CERT_PRIVKEY="$ACME_CONFIG_DIR/live/$CERT_NAME/privkey.pem"
   [[ -r "$CERT_FULLCHAIN" && -r "$CERT_PRIVKEY" ]] || die 'Certificate files were not published by Certbot.'
   record_resource certificate "$CERT_NAME" created
-  export CERT_NAME CERT_FULLCHAIN CERT_PRIVKEY
+  upsert_env_value "$CONFIG_DIR/rhmcp.env" RHMCP_CERT_NAME "$CERT_NAME"
+  upsert_env_value "$CONFIG_DIR/rhmcp.env" RHMCP_CERT_FULLCHAIN "$CERT_FULLCHAIN"
+  upsert_env_value "$CONFIG_DIR/rhmcp.env" RHMCP_CERT_RENEWAL_MODE "$CERT_RENEWAL_MODE"
+  export CERT_NAME CERT_FULLCHAIN CERT_PRIVKEY CERT_RENEWAL_MODE
 }
 
 renewal_dry_run_gate() {
@@ -248,23 +270,37 @@ verify_external_https() {
   ok "External HTTPS PASS: $url"
 }
 
+_cloudflare_dns01_available_or_prompt() {
+  local mode="$1" token_file
+  token_file="$(cloudflare_dns_token_file 2>/dev/null || true)"
+  [[ -r "$token_file" ]] && return 0
+  [[ "$mode" == cloudflare-dns-only || "$mode" == cloudflare-proxied ]] || return 1
+  configure_cloudflare_dns_secret
+  [[ -r "$token_file" ]]
+}
+
 configure_domain_https() {
-  local host="$1" email="$2" dns_mode="${3:-unknown}" port="${4:-443}" probe_rc=0 token_file
+  local host="$1" email="$2" dns_mode="${3:-unknown}" port="${4:-443}" probe_rc=0
   ensure_nginx_for_direct
   ensure_product_certbot
   write_managed_nginx_http "$host" "$LOCAL_PORT" "$ACME_WEBROOT"
-  token_file="$(cloudflare_dns_token_file 2>/dev/null || true)"
 
   if [[ "$dns_mode" == cloudflare-proxied ]]; then
-    [[ -r "$token_file" ]] || die 'Cloudflare Proxied + Full(strict) requires DNS-01 token for origin certificate automation.'
+    _cloudflare_dns01_available_or_prompt "$dns_mode" || die 'Cloudflare Proxied + Full(strict) requires DNS-01 automation.'
     issue_domain_dns01 "$host" "$email"
   else
     set +e; acme_external_http_preflight "$host"; probe_rc=$?; set -e
     if [[ $probe_rc -eq 0 ]]; then
       if ! issue_domain_http01 "$host" "$email"; then
-        if [[ -r "$token_file" ]]; then warn 'HTTP-01 issuance failed; falling back to Cloudflare DNS-01.'; issue_domain_dns01 "$host" "$email"; else return 1; fi
+        if _cloudflare_dns01_available_or_prompt "$dns_mode"; then
+          warn 'HTTP-01 issuance failed; falling back to Cloudflare DNS-01.'
+          issue_domain_dns01 "$host" "$email"
+        else
+          fail 'HTTP-01 issuance failed and no supported DNS-01 provider is configured.'
+          return 1
+        fi
       fi
-    elif [[ -r "$token_file" ]]; then
+    elif _cloudflare_dns01_available_or_prompt "$dns_mode"; then
       warn 'HTTP-01 is unavailable; using DNS-01 fallback. This is certificate validation fallback, not a compliance bypass.'
       issue_domain_dns01 "$host" "$email"
     else
@@ -275,8 +311,8 @@ configure_domain_https() {
 
   set_certificate_paths
   write_managed_nginx_https "$host" "$LOCAL_PORT" "$ACME_WEBROOT" "$CERT_FULLCHAIN" "$CERT_PRIVKEY" "$port"
-  setup_renewal_timer
   renewal_dry_run_gate
+  setup_renewal_timer
   verify_external_https "$host" "$port"
 }
 
@@ -293,7 +329,7 @@ configure_public_ip_https() {
   issue_ip_http01 "$ip" "$email"
   set_certificate_paths
   write_managed_nginx_https "$ip" "$LOCAL_PORT" "$ACME_WEBROOT" "$CERT_FULLCHAIN" "$CERT_PRIVKEY" "$port"
-  setup_renewal_timer
   renewal_dry_run_gate
+  setup_renewal_timer
   verify_external_https "$ip" "$port"
 }

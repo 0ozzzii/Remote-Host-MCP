@@ -44,6 +44,59 @@ ensure_nginx_for_direct() {
   fi
 }
 
+ensure_product_certbot() {
+  local venv="$RUNTIME_DIR/certbot-venv" version=''
+  install -d -m 700 "$RUNTIME_DIR"
+  if [[ -x "$venv/bin/certbot" ]]; then version="$($venv/bin/certbot --version 2>/dev/null | awk '{print $2}' || true)"; fi
+  if [[ -z "$version" ]] || ! version_ge "$version" 5.4; then
+    rm -rf -- "$venv"
+    python3 -m venv "$venv"
+    "$venv/bin/python" -m pip install -q --no-cache-dir --upgrade pip
+    "$venv/bin/python" -m pip install -q --no-cache-dir 'certbot>=5.4'
+    version="$($venv/bin/certbot --version | awk '{print $2}')"
+  fi
+  version_ge "$version" 5.4 || die 'Certbot 5.4+ is required for the supported lifecycle.'
+  CERTBOT_BIN="$venv/bin/certbot"
+  ACME_CONFIG_DIR="$CONFIG_DIR/letsencrypt"
+  ACME_WORK_DIR="$STATE_DIR/certbot-work"
+  ACME_LOG_DIR="$LOG_DIR/certbot"
+  ACME_WEBROOT="$STATE_DIR/acme-webroot"
+  install -d -m 700 "$ACME_CONFIG_DIR" "$ACME_WORK_DIR" "$ACME_LOG_DIR"
+  install -d -m 755 "$ACME_WEBROOT/.well-known/acme-challenge"
+  record_resource certbot_runtime "$venv" created
+  record_resource acme_config "$ACME_CONFIG_DIR" created
+  record_resource acme_webroot "$ACME_WEBROOT" created
+  export CERTBOT_BIN ACME_CONFIG_DIR ACME_WORK_DIR ACME_LOG_DIR ACME_WEBROOT
+}
+
+ensure_managed_nginx_config_marker() {
+  local host="$1" config conflict link=''
+  config="$(nginx_product_config_path)" || return 1
+  conflict="$(nginx_host_conflict "$host" "$config" 2>/dev/null || true)"
+  if [[ -n "$conflict" ]]; then
+    record_resource nginx_site "$conflict" shared
+    fail "Existing Nginx vhost already owns ${host}: ${conflict}. Refusing automatic takeover."
+    return 2
+  fi
+  if [[ -e "$config" ]] && ! managed_file_has_marker "$config"; then
+    fail "Foreign Nginx config occupies product path: $config"
+    return 2
+  fi
+  if [[ ! -e "$config" ]]; then
+    install -d -m 755 "$(dirname "$config")"
+    printf '# Managed-By: remote-host-mcp\n' > "$config"
+    chmod 644 "$config"
+    record_resource nginx_site "$config" created
+  fi
+  if [[ "$config" == /etc/nginx/sites-available/* ]]; then
+    link="/etc/nginx/sites-enabled/$(basename "$config")"
+    if [[ -e "$link" && ! -L "$link" ]]; then fail "Foreign Nginx enabled path exists: $link"; return 2; fi
+    ln -sfn "$config" "$link"
+    record_resource nginx_site_link "$link" created
+  fi
+  printf '%s\n' "$config"
+}
+
 configure_domain_https() {
   local host="$1" email="$2" dns_mode="${3:-unknown}"
   local listen_port="${4:-${HTTPS_LISTEN_PORT:-443}}" public_port="${5:-${PUBLIC_HTTPS_PORT:-$listen_port}}"
@@ -58,6 +111,7 @@ configure_domain_https() {
   ensure_product_certbot
 
   if [[ "$dns_only" == true ]]; then
+    ensure_managed_nginx_config_marker "$host" >/dev/null
     _cloudflare_dns01_available_or_prompt "$dns_mode" || die 'DNS-01-only mode requires a supported DNS provider credential (Cloudflare currently supported).'
     issue_domain_dns01 "$host" "$email"
   else
@@ -164,13 +218,7 @@ repair_ingress_lifecycle() {
         [[ -n "$config" ]] || die 'No supported Nginx product config path is available for repair.'
         if [[ -e "$config" ]] && ! managed_file_has_marker "$config"; then die "Foreign Nginx config occupies product path: $config"; fi
         if [[ ! -e "$config" && "$http_listener" == true ]]; then write_managed_nginx_http "$PUBLIC_HOST" "$LOCAL_PORT" "$ACME_WEBROOT"; fi
-        if [[ ! -e "$config" && "$http_listener" == false ]]; then
-          # Create a product-owned placeholder so the HTTPS writer can enforce marker ownership.
-          install -d -m 755 "$(dirname "$config")"
-          printf '# Managed-By: remote-host-mcp\n' > "$config"
-          chmod 644 "$config"
-          record_resource nginx_site "$config" created
-        fi
+        if [[ ! -e "$config" && "$http_listener" == false ]]; then ensure_managed_nginx_config_marker "$PUBLIC_HOST" >/dev/null; fi
         write_managed_nginx_https "$PUBLIC_HOST" "$LOCAL_PORT" "$ACME_WEBROOT" "$CERT_FULLCHAIN" "$CERT_PRIVKEY" "$HTTPS_LISTEN_PORT" "$PUBLIC_HTTPS_PORT" "$http_listener"
         renewal_dry_run_gate
         setup_renewal_timer

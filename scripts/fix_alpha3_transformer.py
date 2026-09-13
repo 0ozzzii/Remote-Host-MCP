@@ -11,5 +11,10 @@ problem = '''replace_once(\n    "src/remote_host_mcp/ssh_helpers.py",\n    "    
 if problem not in text:
     raise RuntimeError("expected ambiguous scp transformer block was not found")
 text = text.replace(problem, "", 1)
+anchor = "# New focused regression tests.\n"
+patch = '''replace_once(\n    "tests/test_audit_closure.py",\n    "        assert len(tools) == 43\\n",\n    "        assert len(tools) == 48\\n",\n)\n\n'''
+if anchor not in text:
+    raise RuntimeError("audit-count insertion anchor not found")
+text = text.replace(anchor, patch + anchor, 1)
 target.write_text(text, encoding="utf-8")
 Path(__file__).unlink(missing_ok=True)

@@ -143,3 +143,81 @@ def test_public_ip_https_never_falls_back_to_dns01(tmp_path: pathlib.Path) -> No
         """
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_dns01_only_domain_path_skips_http01_and_keeps_public_local_ports_separate(tmp_path: pathlib.Path) -> None:
+    dns_marker = tmp_path / "dns01"
+    https_marker = tmp_path / "https"
+    bad_marker = tmp_path / "unexpected-http"
+    result = run_bash(
+        f"""
+        source installer/lib/common.sh
+        source installer/lib/tls.sh
+        source installer/lib/port_hardening.sh
+        LOCAL_PORT=8765
+        PUBLIC_HTTPS_PORT=2012
+        HTTPS_LISTEN_PORT=443
+        DOMAIN_CHALLENGE_MODE=dns-01
+        ACME_WEBROOT={tmp_path!s}/webroot
+        ensure_nginx_for_direct() {{ test "$1" = false; test "$2" = 443; }}
+        ensure_product_certbot() {{ mkdir -p "$ACME_WEBROOT"; }}
+        ensure_managed_nginx_config_marker() {{ :; }}
+        _cloudflare_dns01_available_or_prompt() {{ return 0; }}
+        write_managed_nginx_http() {{ touch {bad_marker!s}; return 90; }}
+        acme_external_http_preflight() {{ touch {bad_marker!s}; return 91; }}
+        issue_domain_http01() {{ touch {bad_marker!s}; return 92; }}
+        issue_domain_dns01() {{ touch {dns_marker!s}; CERT_RENEWAL_MODE=dns-01-cloudflare; }}
+        set_certificate_paths() {{ CERT_FULLCHAIN=/tmp/fake-fullchain; CERT_PRIVKEY=/tmp/fake-privkey; }}
+        write_managed_nginx_https() {{ test "$6" = 443; test "$7" = 2012; test "$8" = false; touch {https_marker!s}; }}
+        renewal_dry_run_gate() {{ :; }}
+        setup_renewal_timer() {{ :; }}
+        verify_external_https() {{ test "$1" = example.com; test "$2" = 2012; }}
+        configure_domain_https example.com ops@example.com cloudflare-dns-only 443 2012 dns-01
+        test -f {dns_marker!s}
+        test -f {https_marker!s}
+        test ! -e {bad_marker!s}
+        """
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_nginx_https_writer_supports_public_to_local_port_mapping_without_http_listener(tmp_path: pathlib.Path) -> None:
+    config = tmp_path / "remote-host-mcp.conf"
+    cert = tmp_path / "fullchain.pem"
+    key = tmp_path / "privkey.pem"
+    webroot = tmp_path / "webroot"
+    config.write_text("# Managed-By: remote-host-mcp\n", encoding="utf-8")
+    cert.write_text("dummy\n", encoding="utf-8")
+    key.write_text("dummy\n", encoding="utf-8")
+    result = run_bash(
+        f"""
+        source installer/lib/common.sh
+        source installer/lib/lifecycle.sh
+        source installer/lib/reverse_proxy.sh
+        RHMCP_NGINX_CONFIG_PATH={config!s}
+        reload_nginx_safely() {{ :; }}
+        write_managed_nginx_https example.com 8765 {webroot!s} {cert!s} {key!s} 443 2012 false
+        grep -q '^    listen 443 ssl;$' {config!s}
+        ! grep -q '^    listen 80;$' {config!s}
+        grep -q 'proxy_pass http://127.0.0.1:8765;' {config!s}
+        """
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_port_hardening_and_configure_contract_is_present() -> None:
+    install = (ROOT / "installer/install.sh").read_text(encoding="utf-8")
+    hardening = (ROOT / "installer/lib/port_hardening.sh").read_text(encoding="utf-8")
+    configure = (ROOT / "installer/lib/configure.sh").read_text(encoding="utf-8")
+    rmcp = (ROOT / "scripts/rmcp.sh").read_text(encoding="utf-8")
+
+    assert "RHMCP_HTTPS_LISTEN_PORT" in install
+    assert "RHMCP_DOMAIN_CHALLENGE_MODE" in install
+    assert "DNS-01 only (no public port 80 required)" in install
+    assert "--no-cache-dir" in install
+    assert "--no-cache-dir" in hardening
+    assert "write_managed_nginx_https" in hardening
+    assert "apply_https_port_mapping" in configure
+    assert "_config_restore_snapshot" in configure
+    assert "configure" in rmcp
+    assert "Configuration (ports/mapping)" in rmcp

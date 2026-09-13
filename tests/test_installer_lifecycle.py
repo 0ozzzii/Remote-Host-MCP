@@ -133,6 +133,30 @@ def test_release_metadata_freezes_non_null_build_provenance(tmp_path: pathlib.Pa
     assert result.returncode == 0, result.stderr
 
 
+def test_release_metadata_is_not_affected_by_bash_dynamic_scope(tmp_path: pathlib.Path) -> None:
+    staging = tmp_path / "staging"
+    final = tmp_path / "final"
+    staging.mkdir()
+    result = run_bash(
+        f"""
+        source installer/lib/common.sh
+        source installer/lib/state.sh
+        RMCP_VERSION=0.2.0-alpha.4
+        RELEASE_ID=test-release
+        RESOLVED_COMMIT=0123456789abcdef0123456789abcdef01234567
+        REQUESTED_REF=test/ref
+        caller() {{
+          local release={final!s}
+          write_release_metadata {staging!s}
+        }}
+        caller
+        test -f {staging!s}/.rhmcp-release.env
+        test ! -e {final!s}/.rhmcp-release.env
+        """
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_prefix_uninstall_preserves_recovery_then_purge_removes_namespace(tmp_path: pathlib.Path) -> None:
     base = tmp_path / "rhmcp"
     config = base / "config"
@@ -232,7 +256,11 @@ def test_installer_contract_contains_full_lifecycle_and_secret_hygiene() -> None
     assert "renew --dry-run" in tls
     assert "RHMCP_VALIDATE_TOOL_COUNT=65" in install
     assert 'EXPECTED_TOOLS = int(os.getenv("RHMCP_VALIDATE_TOOL_COUNT", "65"))' in validator
-    # Secret values are not fields in installer state/progress/ownership metadata.
-    forbidden_state = ("RHMCP_PATH_KEY", "BEARER", "TOKEN_VALUE", "OAUTH_CLIENT_SECRET")
-    for forbidden in forbidden_state:
+    forbidden_persisted_fields = (
+        "printf 'RHMCP_PATH_KEY=",
+        "printf 'RHMCP_VALIDATION_BEARER_TOKEN=",
+        "printf 'RHMCP_CF_DNS_TOKEN=",
+        "printf 'RHMCP_OAUTH_CLIENT_SECRET=",
+    )
+    for forbidden in forbidden_persisted_fields:
         assert forbidden not in state

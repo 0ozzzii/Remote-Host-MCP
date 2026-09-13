@@ -11,11 +11,22 @@ PROTOCOL = "2026-07-28"
 EXPECTED_TOOLS = int(os.getenv("RHMCP_VALIDATE_TOOL_COUNT", "65"))
 URL = os.environ.get("RHMCP_VALIDATE_URL", "")
 BEARER = os.environ.get("RHMCP_VALIDATION_BEARER_TOKEN", "")
+CLIENT_INFO = {"name": "remote-host-mcp-installer", "version": "1"}
+CLIENT_CAPABILITIES: dict = {}
 
 if not URL.startswith(("http://127.0.0.1:", "https://")):
     raise SystemExit("validator URL is missing or unsafe")
 
 session_id: str | None = None
+
+
+def _request_meta() -> dict:
+    """Return the modern MCP envelope required by Remote Host MCP."""
+    return {
+        "io.modelcontextprotocol/protocolVersion": PROTOCOL,
+        "io.modelcontextprotocol/clientCapabilities": CLIENT_CAPABILITIES,
+        "io.modelcontextprotocol/clientInfo": CLIENT_INFO,
+    }
 
 
 def _redact(text: str) -> str:
@@ -40,11 +51,11 @@ def _decode_body(raw: bytes) -> dict:
 
 def rpc(method: str, params: dict | None = None, *, request_id: int | None = 1, tool_name: str | None = None) -> dict:
     global session_id
-    payload: dict = {"jsonrpc": "2.0", "method": method}
+    request_params = dict(params or {})
+    request_params["_meta"] = _request_meta()
+    payload: dict = {"jsonrpc": "2.0", "method": method, "params": request_params}
     if request_id is not None:
         payload["id"] = request_id
-    if params is not None:
-        payload["params"] = params
     body = json.dumps(payload, separators=(",", ":")).encode()
     headers = {
         "Content-Type": "application/json",
@@ -80,8 +91,8 @@ init = rpc(
     "initialize",
     {
         "protocolVersion": PROTOCOL,
-        "capabilities": {},
-        "clientInfo": {"name": "remote-host-mcp-installer", "version": "1"},
+        "capabilities": CLIENT_CAPABILITIES,
+        "clientInfo": CLIENT_INFO,
     },
     request_id=1,
 )

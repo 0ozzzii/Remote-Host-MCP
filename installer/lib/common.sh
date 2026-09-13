@@ -14,6 +14,25 @@ info() { paint "$C_CYAN" '[→]'; printf ' %s\n' "$*"; }
 die() { fail "$*"; exit 1; }
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
+# Some container providers intentionally run the shell as a numeric UID that has
+# no matching /etc/passwd entry. GNU `id -un` exits non-zero in that situation,
+# which would abort the Installer under `set -e`. Preserve normal `id` behavior
+# for every other invocation, but make the no-argument current-user lookup fall
+# back to the stable numeric UID so prefix/portable installs can still proceed.
+id() {
+  if [[ "$#" -eq 1 && "$1" == '-un' ]]; then
+    local current_name
+    current_name="$(command id -un 2>/dev/null || true)"
+    if [[ -n "$current_name" ]]; then
+      printf '%s\n' "$current_name"
+    else
+      command id -u
+    fi
+    return 0
+  fi
+  command id "$@"
+}
+
 confirm() {
   local prompt="${1:-$(t confirm)}" answer
   read -r -p "$prompt [y/N]: " answer || true

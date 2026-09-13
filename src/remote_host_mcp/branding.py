@@ -22,7 +22,7 @@ PRODUCT_NAME = "Remote Host MCP"
 PRODUCT_TITLE = "Remote Host MCP"
 PRODUCT_DESCRIPTION = (
     "General-purpose MCP control plane for remote Linux hosts and containers, "
-    "with shell, PTY, filesystem, transfer, durable jobs, process and service tools."
+    "with shell, PTY, filesystem, transfer, artifacts, SSH, durable jobs, process and service tools."
 )
 
 # Ordered from specific legacy product phrases to the final generic fallback.

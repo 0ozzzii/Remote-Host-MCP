@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import ipaddress
 import json
@@ -24,6 +25,7 @@ from .secure_paths import opened_beneath, opened_parent_beneath
 
 logger = logging.getLogger("remote_host_mcp.ssh")
 _HOST_RE = re.compile(r"^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$")
+_USER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
 _REMOTE_PATH_RE = re.compile(r"^/[A-Za-z0-9._/+=,@%:-]+$")
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 
@@ -181,6 +183,15 @@ def _validate_host(host: str) -> str:
     return value
 
 
+def _validate_user(user: str | None) -> str | None:
+    if user is None:
+        return None
+    value = user.strip()
+    if not _USER_RE.fullmatch(value):
+        raise ValueError("user must be a conservative OpenSSH username")
+    return value
+
+
 def _validate_port(port: int | None) -> int | None:
     if port is not None and (port < 1 or port > 65535):
         raise ValueError("port must be between 1 and 65535")
@@ -258,6 +269,7 @@ async def ssh_check(
     settings: Settings,
 ) -> SshCheckResult:
     host = _validate_host(host)
+    user = _validate_user(user)
     port = _validate_port(port)
     outcome = await _run_ssh_script(
         host=host,
@@ -289,6 +301,7 @@ async def ssh_exec(
     settings: Settings,
 ) -> SshExecResult:
     host = _validate_host(host)
+    user = _validate_user(user)
     port = _validate_port(port)
     command_bytes = command.encode("utf-8")
     if not command.strip() or b"\x00" in command_bytes or len(command_bytes) > settings.max_command_bytes:
@@ -384,11 +397,12 @@ def _freeze_allowed_file(path: str, settings: Settings) -> tuple[Path, int, str]
     return stage, total, digest.hexdigest()
 
 
-async def _remote_sha256(
+async def _remote_file_info(
     *, host: str, user: str | None, port: int | None, remote_path: str,
     connect_timeout_seconds: int, timeout_ms: int, settings: Settings,
-) -> tuple[str | None, _RunOutcome]:
-    script = f"set -eu\nsha256sum -- {shlex.quote(remote_path)} | cut -d ' ' -f1\n".encode()
+) -> tuple[int | None, str | None, _RunOutcome]:
+    quoted = shlex.quote(remote_path)
+    script = f"set -eu\nstat -c '%s' -- {quoted}\nsha256sum -- {quoted} | cut -d ' ' -f1\n".encode()
     outcome = await _run_ssh_script(
         host=host,
         user=user,
@@ -398,10 +412,14 @@ async def _remote_sha256(
         script=script,
         settings=settings,
     )
-    digest = outcome.stdout.strip().splitlines()[0].strip().lower() if outcome.returncode == 0 and outcome.stdout.strip() else None
-    if digest is not None and not _SHA256_RE.fullmatch(digest):
-        digest = None
-    return digest, outcome
+    lines = [line.strip() for line in outcome.stdout.splitlines() if line.strip()]
+    if outcome.returncode != 0 or len(lines) < 2 or not lines[0].isdigit():
+        return None, None, outcome
+    size = int(lines[0])
+    digest = lines[1].lower()
+    if not _SHA256_RE.fullmatch(digest):
+        return None, None, outcome
+    return size, digest, outcome
 
 
 async def _cleanup_remote_temp(
@@ -434,6 +452,7 @@ async def ssh_upload(
     settings: Settings,
 ) -> SshTransferResult:
     host = _validate_host(host)
+    user = _validate_user(user)
     port = _validate_port(port)
     remote_path = _validate_remote_path(remote_path)
     if timeout_ms < 1000 or timeout_ms > 3_600_000:
@@ -484,11 +503,11 @@ async def ssh_upload(
                 bytes_transferred=0, sha256=digest, duration_ms=int((time.monotonic() - started) * 1000),
                 replaced=False, error=ToolErrorInfo(code="SSH_REMOTE_COMMIT_FAILED", message="Remote publication failed"),
             )
-        remote_digest, hash_outcome = await _remote_sha256(
+        remote_size, remote_digest, hash_outcome = await _remote_file_info(
             host=host, user=user, port=port, remote_path=remote_path,
             connect_timeout_seconds=connect_timeout_seconds, timeout_ms=min(timeout_ms, 60000), settings=settings,
         )
-        if hash_outcome.returncode != 0 or remote_digest != digest:
+        if hash_outcome.returncode != 0 or remote_size != size or remote_digest != digest:
             return SshTransferResult(
                 success=False, direction="upload", host=host, port=port, user=user,
                 local_path=str(settings.resolve_allowed_path(local_path)), remote_path=remote_path,
@@ -548,7 +567,7 @@ def _publish_download(source: Path, local_path: str, overwrite: bool, mode: int,
                 try:
                     rename_noreplace(parent_fd, stage_name, parent_fd, name)
                 except OSError as exc:
-                    if exc.errno == 17:
+                    if exc.errno == errno.EEXIST:
                         raise ValueError("Download destination appeared during commit and overwrite=false") from exc
                     raise
             os.fsync(parent_fd)
@@ -576,6 +595,7 @@ async def ssh_download(
     settings: Settings,
 ) -> SshTransferResult:
     host = _validate_host(host)
+    user = _validate_user(user)
     port = _validate_port(port)
     remote_path = _validate_remote_path(remote_path)
     if timeout_ms < 1000 or timeout_ms > 3_600_000:
@@ -585,17 +605,19 @@ async def ssh_download(
     temp = _state_dir(settings) / f"download-{secrets.token_hex(12)}"
     started = time.monotonic()
     try:
-        remote_digest, hash_outcome = await _remote_sha256(
+        remote_size, remote_digest, hash_outcome = await _remote_file_info(
             host=host, user=user, port=port, remote_path=remote_path,
             connect_timeout_seconds=connect_timeout_seconds, timeout_ms=min(timeout_ms, 60000), settings=settings,
         )
-        if hash_outcome.returncode != 0 or remote_digest is None:
+        if hash_outcome.returncode != 0 or remote_size is None or remote_digest is None:
             return SshTransferResult(
                 success=False, direction="download", host=host, port=port, user=user,
                 local_path=str(Path(local_path).expanduser()), remote_path=remote_path,
                 bytes_transferred=0, sha256=None, duration_ms=int((time.monotonic() - started) * 1000),
                 replaced=False, error=ToolErrorInfo(code="SSH_REMOTE_HASH_FAILED", message="Could not obtain remote SHA-256 before download"),
             )
+        if remote_size > settings.max_transfer_bytes:
+            raise ValueError(f"Remote file exceeds transfer limit {settings.max_transfer_bytes}")
         scp = _client_binary("scp")
         argv = [scp, *_ssh_options(connect_timeout_seconds), "-q"]
         if port is not None:

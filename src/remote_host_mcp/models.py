@@ -354,6 +354,47 @@ class ServiceActionResult(BaseModel):
     status: ServiceStatusResult
 
 
+class SshCheckResult(BaseModel):
+    success: bool
+    host: str
+    port: int | None = Field(default=None, ge=1, le=65535)
+    user: str | None = None
+    duration_ms: int = Field(ge=0)
+    error: ToolErrorInfo | None = None
+
+
+class SshExecResult(BaseModel):
+    success: bool
+    host: str
+    port: int | None = Field(default=None, ge=1, le=65535)
+    user: str | None = None
+    exit_code: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    duration_ms: int = Field(ge=0)
+    timed_out: bool = False
+    terminated_by: str | None = None
+    truncated: bool = False
+    output_bytes_returned: int = Field(default=0, ge=0)
+    output_bytes_total: int = Field(default=0, ge=0)
+    error: ToolErrorInfo | None = None
+
+
+class SshTransferResult(BaseModel):
+    success: bool
+    direction: str
+    host: str
+    port: int | None = Field(default=None, ge=1, le=65535)
+    user: str | None = None
+    local_path: str
+    remote_path: str
+    bytes_transferred: int = Field(ge=0)
+    sha256: str | None = None
+    duration_ms: int = Field(ge=0)
+    replaced: bool = False
+    error: ToolErrorInfo | None = None
+
+
 class SystemInfoResult(BaseModel):
     hostname: str
     kernel: str

@@ -345,7 +345,7 @@ async def test_exact_tool_manifest_and_strict_top_level_input_schemas(
         listed = await client.list_tools()
     tools = {tool.name: tool for tool in listed.tools}
     assert sorted(tools) == sorted(expected)
-    assert len(tools) == 43
+    assert len(tools) == 48
     for tool in tools.values():
         assert tool.input_schema.get("additionalProperties") is False
     assert set(tools["service_action"].input_schema["properties"]["action"]["enum"]) == {"start", "stop", "restart"}
@@ -368,4 +368,4 @@ def test_doctor_and_provenance_are_machine_verifiable_and_secret_free(
     assert fake_secret not in encoded
     assert report["configuration"]["public_url"].endswith("/mcp/[REDACTED]")
     assert report["build"]["commit"] == "a" * 40
-    assert __version__ == "0.2.0a2"
+    assert __version__ == "0.2.0a3"

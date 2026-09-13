@@ -388,14 +388,15 @@ async def test_mature_mcp_tool_contract(monkeypatch: pytest.MonkeyPatch, tmp_pat
             "status", "list_directory", "path_info", "read_text_file", "read_file_chunk", "hash_file",
             "write_text_file", "make_directory", "move_path", "copy_path", "remove_path", "chmod_path",
             "upload_begin", "upload_chunk", "upload_status", "upload_finish", "upload_abort",
-            "download_info", "download_chunk", "exec",
+            "download_info", "download_chunk", "file_artifact", "ssh_check", "ssh_exec", "ssh_upload", "ssh_download", "exec",
             "job_start", "job_status", "job_read", "job_cancel", "job_list", "job_cleanup",
             "terminal_open", "terminal_exec", "terminal_write", "terminal_read", "terminal_status",
             "terminal_screen", "terminal_resize", "terminal_signal", "terminal_list", "terminal_close",
             "process_list", "process_info", "process_signal", "service_status", "service_action", "system_info",
         }
         assert expected <= set(tools)
-        assert all(tool.output_schema is not None for tool in tools.values())
+        assert tools["file_artifact"].output_schema is None
+        assert all(tool.output_schema is not None for name, tool in tools.items() if name != "file_artifact")
         assert tools["job_start"].annotations.destructive_hint is True
         assert tools["job_start"].annotations.idempotent_hint is False
         assert tools["job_start"].annotations.open_world_hint is True

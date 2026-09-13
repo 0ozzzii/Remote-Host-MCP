@@ -45,6 +45,8 @@ preflight() {
   ok "Python $(python3 --version 2>&1 | awk '{print $2}')"
   command_exists curl && ok 'curl' || die 'curl is required / 需要 curl'
   command_exists tar && ok 'tar' || die 'tar is required / 需要 tar'
+  command_exists ssh && ok 'OpenSSH client' || warn 'ssh client not found; ssh_* tools will fail closed until OpenSSH is installed'
+  command_exists scp && ok 'SCP client' || warn 'scp client not found; ssh_upload/ssh_download will fail closed until OpenSSH is installed'
   if command_exists systemctl && [[ -d /run/systemd/system ]]; then ok 'systemd'; else warn 'systemd unavailable; portable service backend will be used'; fi
   [[ -d /mnt/workspace ]] && ok '/mnt/workspace detected' || true
 }

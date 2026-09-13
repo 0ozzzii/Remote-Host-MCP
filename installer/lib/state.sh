@@ -71,6 +71,20 @@ load_progress_state() {
   source "$PROGRESS_STATE"
 }
 
+read_progress_completed_stage() {
+  local raw
+  [[ -f "$PROGRESS_STATE" ]] || return 1
+  raw="$(sed -n 's/^LAST_COMPLETED_STAGE=//p' "$PROGRESS_STATE" | head -n 1)"
+  case "$raw" in
+    NONE|PRECHECK|PREPARE|RELEASE|RUNTIME|CLI_RECOVERY|SERVICE|LOCAL_READY|INGRESS|TLS|PUBLIC_READY|MCP_VERIFY|COMPLETE)
+      printf '%s\n' "$raw"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 restore_transaction_state() {
   load_progress_state || return 1
   [[ "$INSTALL_STATUS" == INCOMPLETE ]] || return 1

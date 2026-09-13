@@ -88,6 +88,8 @@ write_progress_state() {
     printf 'TARGET_LOCAL_PORT=%s\n' "$(state_escape "${LOCAL_PORT:-}")"
     printf 'TARGET_PUBLIC_HOST=%s\n' "$(state_escape "${PUBLIC_HOST:-}")"
     printf 'TARGET_PUBLIC_HTTPS_PORT=%s\n' "$(state_escape "${PUBLIC_HTTPS_PORT:-443}")"
+    printf 'TARGET_HTTPS_LISTEN_PORT=%s\n' "$(state_escape "${HTTPS_LISTEN_PORT:-${PUBLIC_HTTPS_PORT:-443}}")"
+    printf 'TARGET_DOMAIN_CHALLENGE_MODE=%s\n' "$(state_escape "${DOMAIN_CHALLENGE_MODE:-auto}")"
     printf 'TARGET_AUTH_MODE=%s\n' "$(state_escape "${AUTH_MODE:-}")"
     printf 'LAST_ERROR_CLASS=%s\n' "$(state_escape "$error_class")"
   } > "$tmp"
@@ -119,8 +121,10 @@ restore_transaction_state() {
   LOCAL_PORT="${TARGET_LOCAL_PORT:-$LOCAL_PORT}"
   PUBLIC_HOST="${TARGET_PUBLIC_HOST:-$PUBLIC_HOST}"
   PUBLIC_HTTPS_PORT="${TARGET_PUBLIC_HTTPS_PORT:-443}"
+  HTTPS_LISTEN_PORT="${TARGET_HTTPS_LISTEN_PORT:-$PUBLIC_HTTPS_PORT}"
+  DOMAIN_CHALLENGE_MODE="${TARGET_DOMAIN_CHALLENGE_MODE:-auto}"
   AUTH_MODE="${TARGET_AUTH_MODE:-$AUTH_MODE}"
-  export RESOLVED_COMMIT REQUESTED_REF RELEASE_ID AUTHORITY SERVICE_USER INGRESS LOCAL_PORT PUBLIC_HOST PUBLIC_HTTPS_PORT AUTH_MODE
+  export RESOLVED_COMMIT REQUESTED_REF RELEASE_ID AUTHORITY SERVICE_USER INGRESS LOCAL_PORT PUBLIC_HOST PUBLIC_HTTPS_PORT HTTPS_LISTEN_PORT DOMAIN_CHALLENGE_MODE AUTH_MODE
 }
 
 ownership_key() {
@@ -182,6 +186,8 @@ write_install_state() {
     printf 'RHMCP_LOCAL_PORT=%s\n' "$(state_escape "$LOCAL_PORT")"
     printf 'RHMCP_PUBLIC_HOST_STATE=%s\n' "$(state_escape "$PUBLIC_HOST")"
     printf 'RHMCP_PUBLIC_HTTPS_PORT=%s\n' "$(state_escape "${PUBLIC_HTTPS_PORT:-443}")"
+    printf 'RHMCP_HTTPS_LISTEN_PORT=%s\n' "$(state_escape "${HTTPS_LISTEN_PORT:-${PUBLIC_HTTPS_PORT:-443}}")"
+    printf 'RHMCP_DOMAIN_CHALLENGE_MODE=%s\n' "$(state_escape "${DOMAIN_CHALLENGE_MODE:-auto}")"
     printf 'RHMCP_SERVICE_BACKEND=%s\n' "$(state_escape "$SERVICE_BACKEND")"
   } > "$tmp"
   chmod 600 "$tmp"

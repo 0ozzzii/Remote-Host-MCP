@@ -26,6 +26,10 @@ This change set closes the remaining findings consolidated from the functional s
 - Short exec cancellation already terminates/reaps its process group; terminal close already terminates foreground work and joins the reader thread.
 - Durable recovery already observes persisted PID+start-ticks state and never replays `command.bin`; the new tombstone closes replay after cleanup.
 
+## Validation policy
+
+The one-shot transformation and TOCTOU follow-up workflows/scripts are intentionally removed after producing the candidate. They are migration scaffolding, not permanent product CI. The final candidate is accepted only when the permanent `Remote Host MCP validation`, `Remote Host MCP installer validation`, and `Remote Host MCP repair validation` workflows all execute successfully on the final branch head. The standard validation must continue to prove the full pytest suite, Python compilation, MCP wire/branding/Tasks behavior, the exact 43-tool surface, and static destructive/secret hygiene.
+
 ## Release identity
 
 Candidate version: `0.2.0-alpha.2` / Python `0.2.0a2`.

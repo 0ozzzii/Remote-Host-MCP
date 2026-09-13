@@ -205,7 +205,7 @@ def test_nginx_https_writer_supports_public_to_local_port_mapping_without_http_l
     assert result.returncode == 0, result.stderr
 
 
-def test_portable_certificate_renewal_is_identity_tracked_and_stoppable(tmp_path: pathlib.Path) -> None:
+def test_portable_certificate_renewal_is_identity_tracked_stoppable_and_reaps_child(tmp_path: pathlib.Path) -> None:
     config = tmp_path / "config"
     state = tmp_path / "state"
     logs = tmp_path / "logs"
@@ -242,10 +242,32 @@ def test_portable_certificate_renewal_is_identity_tracked_and_stoppable(tmp_path
         test "$(resource_value portable_cert_renew_pid OWNERSHIP)" = created
         test "$(resource_value cert_renew_loop OWNERSHIP)" = created
         grep -q '^RHMCP_CERT_RENEW_BACKEND=portable$' {env_file!s}
+
+        parent_pid="$(cat "$pidfile")"
+        child_pid=''
+        for _ in {{1..40}}; do
+          child_pid="$(cat "/proc/$parent_pid/task/$parent_pid/children" 2>/dev/null | awk '{{print $1}}')"
+          [[ "$child_pid" =~ ^[0-9]+$ ]] && break
+          sleep 0.05
+        done
+        [[ "$child_pid" =~ ^[0-9]+$ ]]
+        child_ticks="$(_portable_proc_start_ticks "$child_pid")"
+        [[ "$child_ticks" =~ ^[0-9]+$ ]]
+
         stop_portable_renewal "$pidfile" "$loop"
         test ! -e "$pidfile"
         test ! -e "${{pidfile}}.start_ticks"
         ! portable_renewal_alive "$pidfile" "$loop"
+        for _ in {{1..40}}; do
+          if ! kill -0 "$child_pid" 2>/dev/null; then break; fi
+          current_ticks="$(_portable_proc_start_ticks "$child_pid" 2>/dev/null || true)"
+          [[ "$current_ticks" != "$child_ticks" ]] && break
+          sleep 0.05
+        done
+        if kill -0 "$child_pid" 2>/dev/null; then
+          current_ticks="$(_portable_proc_start_ticks "$child_pid" 2>/dev/null || true)"
+          test "$current_ticks" != "$child_ticks"
+        fi
         """
     )
     assert result.returncode == 0, result.stderr

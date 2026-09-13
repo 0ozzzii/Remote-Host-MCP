@@ -124,14 +124,25 @@ EOF2
 }
 
 write_managed_nginx_https() {
-  local host="$1" port="$2" webroot="$3" cert="$4" key="$5" https_port="${6:-443}" config tmp redirect_port=''
+  local host="$1" port="$2" webroot="$3" cert="$4" key="$5"
+  local https_listen_port="${6:-443}" public_https_port="${7:-${6:-443}}" http_listener="${8:-true}"
+  local config tmp redirect_port=''
   config="$(nginx_product_config_path)" || return 1
   managed_file_has_marker "$config" || return 2
   [[ -r "$cert" && -r "$key" ]] || return 1
-  [[ "$https_port" == 443 ]] || redirect_port=":${https_port}"
+  [[ "$https_listen_port" =~ ^[0-9]+$ && "$https_listen_port" -ge 1 && "$https_listen_port" -le 65535 ]] || return 2
+  [[ "$public_https_port" =~ ^[0-9]+$ && "$public_https_port" -ge 1 && "$public_https_port" -le 65535 ]] || return 2
+  [[ "$http_listener" == true || "$http_listener" == false ]] || return 2
+  if [[ "$http_listener" == true && "$https_listen_port" == 80 ]]; then
+    fail 'HTTPS listen port 80 conflicts with the required HTTP-01 listener.'
+    return 2
+  fi
+  [[ "$public_https_port" == 443 ]] || redirect_port=":${public_https_port}"
   tmp="${config}.tmp.$$"
-  cat > "$tmp" <<EOF2
-# Managed-By: remote-host-mcp
+  : > "$tmp"
+  printf '# Managed-By: remote-host-mcp\n' >> "$tmp"
+  if [[ "$http_listener" == true ]]; then
+    cat >> "$tmp" <<EOF2
 server {
     listen 80;
     server_name ${host};
@@ -143,8 +154,11 @@ server {
     location / { return 308 https://\$host${redirect_port}\$request_uri; }
 }
 
+EOF2
+  fi
+  cat >> "$tmp" <<EOF2
 server {
-    listen ${https_port} ssl;
+    listen ${https_listen_port} ssl;
     server_name ${host};
     ssl_certificate ${cert};
     ssl_certificate_key ${key};

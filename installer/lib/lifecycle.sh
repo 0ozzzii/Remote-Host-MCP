@@ -93,6 +93,7 @@ install_rmcp_launcher() {
 #!/usr/bin/env bash
 # Managed-By: remote-host-mcp
 export RMCP_INSTALL_STATE='${INSTALL_STATE}'
+export RMCP_CONTROLLER_ROOT='${release_root}'
 exec bash '${target}' "\$@"
 EOF2
   chmod 755 "$tmp"
@@ -132,7 +133,7 @@ _safe_install_path() {
 }
 
 load_install_layout_from_state() {
-  local state_file="$1"
+  local state_file="$1" _p
   load_install_state "$state_file" || return 1
   INSTALL_MODE="${RHMCP_INSTALL_MODE:-system}"
   CODE_BASE="${RHMCP_CODE_BASE:-}"

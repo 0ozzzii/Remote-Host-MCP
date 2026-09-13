@@ -35,6 +35,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -118,10 +119,13 @@ jobs:
   lifecycle:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -134,11 +138,13 @@ jobs:
           install_root="$RUNNER_TEMP/rhmcp-lifecycle"
 
           install_once() {
-            printf '2\n%s\n2\n4\n1\n' "$install_root" | bash installer/install.sh
+            printf '2\n%s\n2\n4\n1\n' "$install_root" | bash installer/install.sh | tee "$RUNNER_TEMP/install.log"
             test -x "$install_root/current/.venv/bin/remote-host-mcp"
             test -x "$HOME/.local/bin/rmcp"
             curl -fsS http://127.0.0.1:8765/health > "$RUNNER_TEMP/health.json"
-            python - "$install_root/config/install-state.env" "$GITHUB_SHA" <<'PY'
+            grep -q '/mcp/<redacted>' "$RUNNER_TEMP/install.log"
+            ! grep -q 'RHMCP_PATH_KEY=' "$RUNNER_TEMP/install.log"
+            python - "$install_root/config/install-state.env" "$EXPECTED_SHA" <<'PY'
           import pathlib, shlex, sys
           path=pathlib.Path(sys.argv[1]); expected=sys.argv[2].lower(); data={}
           for line in path.read_text().splitlines():

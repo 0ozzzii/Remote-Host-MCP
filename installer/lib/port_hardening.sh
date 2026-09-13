@@ -3,7 +3,8 @@ set -euo pipefail
 
 # Overrides selected lifecycle/TLS functions after the base libraries are sourced.
 # Purpose: keep public/client HTTPS port separate from the local Nginx listener,
-# and allow Domain DNS-01 installs to avoid any public HTTP-01 requirement.
+# allow Domain DNS-01 installs to avoid any public HTTP-01 requirement, and
+# provide a bounded portable certificate-renewal scheduler when systemd is absent.
 
 ensure_nginx_for_direct() {
   local require_http80="${1:-true}" https_listen_port="${2:-${HTTPS_LISTEN_PORT:-${PUBLIC_HTTPS_PORT:-443}}}"
@@ -95,6 +96,140 @@ ensure_managed_nginx_config_marker() {
     record_resource nginx_site_link "$link" created
   fi
   printf '%s\n' "$config"
+}
+
+_portable_proc_start_ticks() {
+  local pid="$1" stat rest
+  [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/stat" ]] || return 1
+  stat="$(cat "/proc/$pid/stat" 2>/dev/null)" || return 1
+  rest="${stat##*) }"
+  local -a fields=()
+  read -r -a fields <<< "$rest"
+  [[ "${#fields[@]}" -ge 20 ]] || return 1
+  printf '%s\n' "${fields[19]}"
+}
+
+portable_renewal_alive() {
+  local pidfile="${1:-$LOG_DIR/cert-renew.pid}" loop="${2:-$CERTBOT_DIR/renew-loop.sh}" pid expected current cmdline
+  [[ -f "$pidfile" ]] || return 1
+  pid="$(cat "$pidfile" 2>/dev/null || true)"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  current="$(_portable_proc_start_ticks "$pid" 2>/dev/null || true)"
+  [[ "$current" =~ ^[0-9]+$ ]] || return 1
+  expected="$(cat "${pidfile}.start_ticks" 2>/dev/null || true)"
+  [[ "$expected" =~ ^[0-9]+$ && "$expected" == "$current" ]] || return 1
+  cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+  [[ -n "$cmdline" && "$cmdline" == *"$loop"* ]]
+}
+
+stop_portable_renewal() {
+  local pidfile="${1:-$LOG_DIR/cert-renew.pid}" loop="${2:-$CERTBOT_DIR/renew-loop.sh}" pid
+  [[ -f "$pidfile" ]] || { rm -f "${pidfile}.start_ticks"; return 0; }
+  pid="$(cat "$pidfile" 2>/dev/null || true)"
+  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    portable_renewal_alive "$pidfile" "$loop" || {
+      fail "Refusing to stop portable certificate renewal: PID $pid identity mismatch."
+      return 1
+    }
+    kill "$pid" 2>/dev/null || true
+    for _ in {1..30}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "$pid" 2>/dev/null; then
+      portable_renewal_alive "$pidfile" "$loop" || return 1
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$pidfile" "${pidfile}.start_ticks"
+}
+
+setup_portable_renewal() {
+  local loop="$CERTBOT_DIR/renew-loop.sh" pidfile="$LOG_DIR/cert-renew.pid" logfile="$LOG_DIR/cert-renew.log"
+  local interval="${RHMCP_CERT_RENEW_INTERVAL_S:-43200}" pid ticks
+  [[ "$interval" =~ ^[0-9]+$ && "$interval" -ge 60 ]] || die 'Portable certificate renewal interval must be at least 60 seconds.'
+  [[ -x "${CERTBOT_RENEW_HOOK:-}" ]] || die 'Certificate renewal hook is unavailable.'
+  install -d -m 700 "$CERTBOT_DIR"
+  install -d -m 755 "$LOG_DIR"
+  cat > "$loop" <<EOF2
+#!/usr/bin/env bash
+set -u
+interval=$(printf '%q' "$interval")
+renew_hook=$(printf '%q' "$CERTBOT_RENEW_HOOK")
+log_file=$(printf '%q' "$logfile")
+while :; do
+  sleep "\$interval" || exit 0
+  /bin/bash "\$renew_hook" >>"\$log_file" 2>&1 || true
+done
+EOF2
+  chmod 700 "$loop"
+  record_resource cert_renew_loop "$loop" created
+  if portable_renewal_alive "$pidfile" "$loop"; then
+    upsert_env_value "$CONFIG_DIR/rhmcp.env" RHMCP_CERT_RENEW_BACKEND portable
+    ok 'Portable certificate renewal scheduler already running.'
+    return 0
+  fi
+  stop_portable_renewal "$pidfile" "$loop" || die 'Could not safely clear stale portable certificate-renewal state.'
+  nohup /bin/bash "$loop" >/dev/null 2>&1 &
+  pid=$!
+  ticks="$(_portable_proc_start_ticks "$pid" 2>/dev/null || true)"
+  if [[ ! "$ticks" =~ ^[0-9]+$ ]]; then
+    kill "$pid" 2>/dev/null || true
+    die 'Could not record portable certificate-renewal process identity.'
+  fi
+  printf '%s\n' "$pid" > "$pidfile"
+  printf '%s\n' "$ticks" > "${pidfile}.start_ticks"
+  chmod 600 "$pidfile" "${pidfile}.start_ticks"
+  sleep 0.1
+  portable_renewal_alive "$pidfile" "$loop" || {
+    kill "$pid" 2>/dev/null || true
+    rm -f "$pidfile" "${pidfile}.start_ticks"
+    die 'Portable certificate-renewal scheduler failed to stay running.'
+  }
+  record_resource portable_cert_renew_pid "$pidfile" created
+  upsert_env_value "$CONFIG_DIR/rhmcp.env" RHMCP_CERT_RENEW_BACKEND portable
+  ok 'Portable certificate renewal scheduler enabled (12h default interval).'
+}
+
+setup_renewal_timer() {
+  local service='/etc/systemd/system/remote-host-mcp-cert-renew.service' timer='/etc/systemd/system/remote-host-mcp-cert-renew.timer' tmp
+  if ! systemd_operational; then
+    setup_portable_renewal
+    return
+  fi
+  [[ $EUID -eq 0 ]] || die 'Managed systemd certificate renewal requires root.'
+  stop_portable_renewal "$LOG_DIR/cert-renew.pid" "$CERTBOT_DIR/renew-loop.sh" || die 'Could not safely stop portable certificate renewal before enabling systemd timer.'
+  for tmp in "$service" "$timer"; do
+    if [[ -e "$tmp" ]] && ! managed_file_has_marker "$tmp"; then die "Foreign systemd resource exists: $tmp"; fi
+  done
+  cat > "${service}.tmp.$$" <<EOF2
+# Managed-By: remote-host-mcp
+[Unit]
+Description=Renew Remote Host MCP certificate
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash ${CERTBOT_DIR}/renew.sh
+EOF2
+  chmod 644 "${service}.tmp.$$"; mv -f "${service}.tmp.$$" "$service"
+  cat > "${timer}.tmp.$$" <<'EOF2'
+# Managed-By: remote-host-mcp
+[Unit]
+Description=Renew Remote Host MCP certificate twice daily
+
+[Timer]
+OnCalendar=*-*-* 00,12:00:00
+Persistent=true
+RandomizedDelaySec=900
+
+[Install]
+WantedBy=timers.target
+EOF2
+  chmod 644 "${timer}.tmp.$$"; mv -f "${timer}.tmp.$$" "$timer"
+  record_resource cert_renew_service "$service" created
+  record_resource cert_renew_timer "$timer" created
+  systemctl daemon-reload
+  systemctl enable --now remote-host-mcp-cert-renew.timer
+  upsert_env_value "$CONFIG_DIR/rhmcp.env" RHMCP_CERT_RENEW_BACKEND systemd
 }
 
 configure_domain_https() {

@@ -6,34 +6,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 NEW_TOOLS = [
-    "host_capabilities",
-    "wait_condition",
-    "artifact_info",
-    "artifact_preview",
-    "artifact_bundle",
-    "exec_argv",
-    "snapshot_create",
-    "snapshot_list",
-    "snapshot_restore",
-    "snapshot_delete",
-    "lease_acquire",
-    "lease_status",
-    "lease_list",
-    "lease_release",
-    "inspect_paths",
-    "file_diff",
-    "apply_patch",
+    "host_capabilities", "wait_condition", "artifact_info", "artifact_preview", "artifact_bundle", "exec_argv",
+    "snapshot_create", "snapshot_list", "snapshot_restore", "snapshot_delete",
+    "lease_acquire", "lease_status", "lease_list", "lease_release", "inspect_paths", "file_diff", "apply_patch",
 ]
 READ_ONLY_NEW = [
-    "host_capabilities",
-    "wait_condition",
-    "artifact_info",
-    "artifact_preview",
-    "snapshot_list",
-    "lease_status",
-    "lease_list",
-    "inspect_paths",
-    "file_diff",
+    "host_capabilities", "wait_condition", "artifact_info", "artifact_preview", "snapshot_list",
+    "lease_status", "lease_list", "inspect_paths", "file_diff",
 ]
 HIGH_RISK_NEW = ["exec_argv", "snapshot_restore", "snapshot_delete", "apply_patch"]
 
@@ -48,8 +27,7 @@ def write(path: str, text: str) -> None:
 
 def replace_once(path: str, old: str, new: str) -> None:
     text = read(path)
-    count = text.count(old)
-    if count < 1:
+    if old not in text:
         raise RuntimeError(f"{path}: replacement anchor not found: {old!r}")
     write(path, text.replace(old, new, 1))
 
@@ -81,28 +59,16 @@ manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
 
 openai_path = "tests/test_openai_mcp_contract.py"
 expected_insert = "".join(f'    "{name}",\n' for name in NEW_TOOLS)
-replace_once(
-    openai_path,
-    '    "ssh_download",\n    "exec",\n',
-    '    "ssh_download",\n' + expected_insert + '    "exec",\n',
-)
+replace_once(openai_path, '    "ssh_download",\n    "exec",\n', '    "ssh_download",\n' + expected_insert + '    "exec",\n')
 readonly_insert = "".join(f'    "{name}",\n' for name in READ_ONLY_NEW)
-replace_once(
-    openai_path,
-    '    "ssh_check",\n    "job_status",\n',
-    '    "ssh_check",\n' + readonly_insert + '    "job_status",\n',
-)
+replace_once(openai_path, '    "ssh_check",\n    "job_status",\n', '    "ssh_check",\n' + readonly_insert + '    "job_status",\n')
 replace_once(
     openai_path,
     'OPEN_WORLD_TOOLS = {"exec", "job_run", "job_start", "terminal_exec", "terminal_write", "ssh_check", "ssh_exec", "ssh_upload", "ssh_download"}',
     'OPEN_WORLD_TOOLS = {"exec", "exec_argv", "job_run", "job_start", "terminal_exec", "terminal_write", "ssh_check", "ssh_exec", "ssh_upload", "ssh_download"}',
 )
 high_risk_insert = "".join(f'    "{name}",\n' for name in HIGH_RISK_NEW)
-replace_once(
-    openai_path,
-    '    "ssh_download",\n    "exec",\n',
-    '    "ssh_download",\n' + high_risk_insert + '    "exec",\n',
-)
+replace_once(openai_path, '    "ssh_download",\n    "exec",\n', '    "ssh_download",\n' + high_risk_insert + '    "exec",\n')
 
 mature_insert = ", ".join(f'"{name}"' for name in NEW_TOOLS)
 replace_once(
@@ -111,11 +77,15 @@ replace_once(
     '            "download_info", "download_chunk", "file_artifact", "ssh_check", "ssh_exec", "ssh_upload", "ssh_download",\n'
     f'            {mature_insert}, "exec",\n',
 )
-for path in ("tests/test_audit_closure.py", "tests/test_rhmcp_branding.py"):
+
+for path in ("tests/test_audit_closure.py", "tests/test_rhmcp_branding.py", "tests/test_remote_artifacts_ssh.py"):
     text = read(path)
     if "== 48" not in text:
         raise RuntimeError(f"{path}: missing alpha3 48-tool count assertion")
     write(path, text.replace("== 48", "== 65"))
+replace_once("tests/test_audit_closure.py", 'assert __version__ == "0.2.0a3"', 'assert __version__ == "0.2.0a4"')
+text = read("tests/test_remote_artifacts_ssh.py")
+write("tests/test_remote_artifacts_ssh.py", text.replace("test_canonical_surface_has_48_tools_and_no_ssh_credential_arguments", "test_canonical_surface_has_65_tools_and_no_ssh_credential_arguments"))
 
 replace_once(
     "README.md",

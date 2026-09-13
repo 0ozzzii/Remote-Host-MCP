@@ -95,8 +95,12 @@ apply_https_port_mapping() {
     return 2
   }
   nginx_config="$(nginx_product_config_path 2>/dev/null || true)"
-  [[ -n "$nginx_config" && -f "$nginx_config" && $(managed_file_has_marker "$nginx_config"; printf '%s' $?) == 0 ]] || {
-    fail 'Managed Nginx config is unavailable or foreign; refusing configuration rewrite.'
+  [[ -n "$nginx_config" && -f "$nginx_config" ]] || {
+    fail 'Managed Nginx config is unavailable; refusing configuration rewrite.'
+    return 2
+  }
+  managed_file_has_marker "$nginx_config" || {
+    fail 'Nginx product path is foreign; refusing configuration rewrite.'
     return 2
   }
 

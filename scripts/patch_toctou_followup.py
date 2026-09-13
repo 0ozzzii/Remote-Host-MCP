@@ -188,7 +188,7 @@ PATH.write_text(text, encoding="utf-8")
 
 TEST = ROOT / "tests/test_audit_closure.py"
 test = TEST.read_text(encoding="utf-8")
-anchor = '''    def test_copy_failure_never_destroys_existing_destination(
+anchor = '''def test_copy_failure_never_destroys_existing_destination(
 '''
 addition = dedent('''
     def test_expected_sha_symlink_swap_rolls_back_without_touching_victim(

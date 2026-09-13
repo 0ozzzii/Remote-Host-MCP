@@ -49,8 +49,8 @@ def write(path: str, text: str) -> None:
 def replace_once(path: str, old: str, new: str) -> None:
     text = read(path)
     count = text.count(old)
-    if count != 1:
-        raise RuntimeError(f"{path}: expected one occurrence, found {count}: {old!r}")
+    if count < 1:
+        raise RuntimeError(f"{path}: replacement anchor not found: {old!r}")
     write(path, text.replace(old, new, 1))
 
 

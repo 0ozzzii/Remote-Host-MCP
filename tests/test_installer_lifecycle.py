@@ -90,6 +90,24 @@ def test_bounded_readiness_accepts_delayed_server(tmp_path: pathlib.Path) -> Non
     assert result.returncode == 0, result.stderr
 
 
+def test_port_listening_tracks_live_listener_not_bind_reuse_state() -> None:
+    port = free_port()
+    result = run_bash(
+        f"""
+        source installer/lib/ports.sh
+        python3 -m http.server {port} --bind 127.0.0.1 >/dev/null 2>&1 & pid=$!
+        trap 'kill "$pid" 2>/dev/null || true' EXIT
+        for _ in {{1..30}}; do port_listening {port} && break; sleep 0.1; done
+        port_listening {port}
+        kill "$pid"
+        wait "$pid" 2>/dev/null || true
+        ! port_listening {port}
+        """,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_resource_registry_tracks_ownership_classes(tmp_path: pathlib.Path) -> None:
     registry = tmp_path / "ownership.env"
     result = run_bash(
@@ -152,6 +170,65 @@ def test_release_metadata_is_not_affected_by_bash_dynamic_scope(tmp_path: pathli
         caller
         test -f {staging!s}/.rhmcp-release.env
         test ! -e {final!s}/.rhmcp-release.env
+        """
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_progress_journal_never_regresses_completed_stage(tmp_path: pathlib.Path) -> None:
+    progress = tmp_path / "progress.env"
+    result = run_bash(
+        f"""
+        source installer/lib/state.sh
+        PROGRESS_STATE={progress!s}
+        RMCP_VERSION=0.2.0-alpha.4
+        RESOLVED_COMMIT=0123456789abcdef0123456789abcdef01234567
+        REQUESTED_REF=test/ref
+        RELEASE_ID=test-release
+        INSTALL_MODE=prefix
+        CODE_BASE=/tmp/rhmcp-test
+        LAST_COMPLETED_STAGE=NONE
+        write_progress_state INCOMPLETE PRECHECK ''
+        write_progress_state INCOMPLETE PUBLIC_READY ''
+        write_progress_state INCOMPLETE PRECHECK INSTALLER_FAILURE
+        test "$(read_progress_completed_stage)" = PUBLIC_READY
+        test "$LAST_COMPLETED_STAGE" = PUBLIC_READY
+        grep -q '^LAST_ERROR_CLASS=INSTALLER_FAILURE$' {progress!s}
+        """
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_restore_transaction_state_keeps_fixed_commit_and_stage(tmp_path: pathlib.Path) -> None:
+    progress = tmp_path / "progress.env"
+    result = run_bash(
+        f"""
+        source installer/lib/state.sh
+        PROGRESS_STATE={progress!s}
+        RMCP_VERSION=0.2.0-alpha.4
+        RESOLVED_COMMIT=0123456789abcdef0123456789abcdef01234567
+        REQUESTED_REF=test/ref
+        RELEASE_ID=test-release
+        INSTALL_MODE=prefix
+        CODE_BASE=/tmp/rhmcp-test
+        AUTHORITY=user
+        SERVICE_USER=tester
+        INGRESS=private
+        LOCAL_PORT=9876
+        PUBLIC_HOST=mcp.invalid
+        PUBLIC_HTTPS_PORT=443
+        AUTH_MODE=capability
+        write_progress_state INCOMPLETE SERVICE READINESS_TIMEOUT
+        RESOLVED_COMMIT=ffffffffffffffffffffffffffffffffffffffff
+        REQUESTED_REF=wrong/ref
+        RELEASE_ID=wrong
+        LOCAL_PORT=1234
+        restore_transaction_state
+        test "$RESOLVED_COMMIT" = 0123456789abcdef0123456789abcdef01234567
+        test "$REQUESTED_REF" = test/ref
+        test "$RELEASE_ID" = test-release
+        test "$LOCAL_PORT" = 9876
+        test "$LAST_COMPLETED_STAGE" = SERVICE
         """
     )
     assert result.returncode == 0, result.stderr
@@ -256,6 +333,12 @@ def test_installer_contract_contains_full_lifecycle_and_secret_hygiene() -> None
     assert "renew --dry-run" in tls
     assert "RHMCP_VALIDATE_TOOL_COUNT=65" in install
     assert 'EXPECTED_TOOLS = int(os.getenv("RHMCP_VALIDATE_TOOL_COUNT", "65"))' in validator
+    assert 'rpc("server/discover"' in validator
+    assert '"initialize"' not in validator
+    assert '"io.modelcontextprotocol/protocolVersion"' in validator
+    assert '"io.modelcontextprotocol/clientCapabilities"' in validator
+    assert '"io.modelcontextprotocol/clientInfo"' in validator
+    assert 'SERVER_INFO_META_KEY = "io.modelcontextprotocol/serverInfo"' in validator
     forbidden_persisted_fields = (
         "printf 'RHMCP_PATH_KEY=",
         "printf 'RHMCP_VALIDATION_BEARER_TOKEN=",

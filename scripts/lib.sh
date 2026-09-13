@@ -32,6 +32,10 @@ info() { paint "$C_CYAN" 'INFO'; printf '  %s\n' "$*"; }
 warn() { paint "$C_YELLOW" 'WARN'; printf '  %s\n' "$*"; }
 die() { paint "$C_RED" 'ERROR'; printf '  %s\n' "$*" >&2; exit 1; }
 
+rmcp_version() {
+  tr -d '\r\n' < "$RMCP_ROOT/VERSION" 2>/dev/null || printf 'unknown'
+}
+
 ensure_dirs() {
   mkdir -p "$RMCP_LOG_DIR" "$RMCP_SECRET_DIR" "$RMCP_BACKUP_DIR" "$RMCP_RUNTIME_DIR/bin"
   chmod 700 "$RMCP_SECRET_DIR" "$RMCP_BACKUP_DIR" 2>/dev/null || true
@@ -156,12 +160,13 @@ EOF
 
 print_final_connection() {
   load_env || die "Missing .env"
-  local key host port
+  local key host port version
   key="$(mcp_env_value PATH_KEY 2>/dev/null || true)"
   host="$(mcp_env_value PUBLIC_HOST 2>/dev/null || true)"
   port="$(mcp_env_value PORT 2>/dev/null || printf '8765')"
+  version="$(rmcp_version)"
   [[ -n "$key" && -n "$host" ]] || die "Missing MCP host/key"
-  header 'Remote Host MCP 0.1.0-alpha.1 - DEPLOYMENT READY'
+  header "Remote Host MCP $version - DEPLOYMENT READY"
   printf 'Local MCP        : http://127.0.0.1:%s\n' "$port"
   printf 'Public Hostname  : %s\n' "$host"
   printf 'MCP Path Key     : %s\n' "$key"
@@ -173,5 +178,6 @@ print_final_connection() {
   printf 'Authentication   : capability URL (OAuth optional)\n'
   subhr
   warn 'The full MCP URL contains a credential. Do not commit or publish it.'
+  printf 'Show it again later with: rmcp connection --show-secret\n'
   hr
 }

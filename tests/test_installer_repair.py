@@ -205,11 +205,58 @@ def test_nginx_https_writer_supports_public_to_local_port_mapping_without_http_l
     assert result.returncode == 0, result.stderr
 
 
+def test_portable_certificate_renewal_is_identity_tracked_and_stoppable(tmp_path: pathlib.Path) -> None:
+    config = tmp_path / "config"
+    state = tmp_path / "state"
+    logs = tmp_path / "logs"
+    certbot_dir = config / "certbot"
+    ownership = config / "ownership.env"
+    config.mkdir()
+    state.mkdir()
+    logs.mkdir()
+    certbot_dir.mkdir()
+    env_file = config / "rhmcp.env"
+    env_file.write_text("RHMCP_AUTH_MODE=capability\n", encoding="utf-8")
+    renew = certbot_dir / "renew.sh"
+    renew.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    renew.chmod(0o700)
+
+    result = run_bash(
+        f"""
+        source installer/lib/common.sh
+        source installer/lib/state.sh
+        source installer/lib/lifecycle.sh
+        source installer/lib/port_hardening.sh
+        CONFIG_DIR={config!s}
+        STATE_DIR={state!s}
+        LOG_DIR={logs!s}
+        CERTBOT_DIR={certbot_dir!s}
+        OWNERSHIP_STATE={ownership!s}
+        CERTBOT_RENEW_HOOK={renew!s}
+        RHMCP_CERT_RENEW_INTERVAL_S=60
+        systemd_operational() {{ return 1; }}
+        setup_renewal_timer
+        pidfile={logs!s}/cert-renew.pid
+        loop={certbot_dir!s}/renew-loop.sh
+        portable_renewal_alive "$pidfile" "$loop"
+        test "$(resource_value portable_cert_renew_pid OWNERSHIP)" = created
+        test "$(resource_value cert_renew_loop OWNERSHIP)" = created
+        grep -q '^RHMCP_CERT_RENEW_BACKEND=portable$' {env_file!s}
+        stop_portable_renewal "$pidfile" "$loop"
+        test ! -e "$pidfile"
+        test ! -e "${{pidfile}}.start_ticks"
+        ! portable_renewal_alive "$pidfile" "$loop"
+        """
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_port_hardening_and_configure_contract_is_present() -> None:
     install = (ROOT / "installer/install.sh").read_text(encoding="utf-8")
     hardening = (ROOT / "installer/lib/port_hardening.sh").read_text(encoding="utf-8")
     configure = (ROOT / "installer/lib/configure.sh").read_text(encoding="utf-8")
     rmcp = (ROOT / "scripts/rmcp.sh").read_text(encoding="utf-8")
+    uninstall = (ROOT / "installer/lib/uninstall.sh").read_text(encoding="utf-8")
 
     assert "RHMCP_HTTPS_LISTEN_PORT" in install
     assert "RHMCP_DOMAIN_CHALLENGE_MODE" in install
@@ -217,6 +264,11 @@ def test_port_hardening_and_configure_contract_is_present() -> None:
     assert "--no-cache-dir" in install
     assert "--no-cache-dir" in hardening
     assert "write_managed_nginx_https" in hardening
+    assert "setup_portable_renewal" in hardening
+    assert "portable_renewal_alive" in hardening
+    assert "RHMCP_CERT_RENEW_BACKEND" in hardening
+    assert "portable_cert_renew_pid" in uninstall
+    assert "cert_renew_loop" in uninstall
     assert "apply_https_port_mapping" in configure
     assert "_config_restore_snapshot" in configure
     assert "configure" in rmcp

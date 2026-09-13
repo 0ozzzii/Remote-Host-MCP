@@ -62,13 +62,31 @@ _disable_owned_systemd_resource() {
   systemctl disable --now "$(basename "$path")" >/dev/null 2>&1 || true
 }
 
+_wait_port_release() {
+  local port="$1" tries="${2:-50}"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 2
+  for ((i=0; i<tries; i++)); do
+    port_free "$port" && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
 _stop_owned_services() {
+  local port="${RHMCP_LOCAL_PORT:-${LOCAL_PORT:-8765}}"
   _disable_owned_systemd_resource cert_renew_timer
   _disable_owned_systemd_resource tunnel_service_unit
   _disable_owned_systemd_resource service_unit
   if [[ "${RHMCP_SERVICE_BACKEND:-}" == portable && -x "${CURRENT_LINK:-}/scripts/manage.sh" ]]; then
     (cd "$CURRENT_LINK" && bash scripts/manage.sh tunnel-stop >/dev/null 2>&1) || true
-    (cd "$CURRENT_LINK" && bash scripts/manage.sh stop >/dev/null 2>&1) || true
+    if ! (cd "$CURRENT_LINK" && bash scripts/manage.sh stop); then
+      fail 'Portable server stop failed; refusing to remove its release/runtime while process identity is unresolved.'
+      return 1
+    fi
+    if ! _wait_port_release "$port"; then
+      fail "Portable server did not release local port ${port}; refusing destructive cleanup."
+      return 1
+    fi
   fi
 }
 
@@ -137,7 +155,7 @@ uninstall_apply() {
   [[ -n "${CONFIG_DIR:-}" && "$CONFIG_DIR" = /* && "$CONFIG_DIR" != / ]] || die 'Unsafe or missing CONFIG_DIR; refusing uninstall.'
   cache_uninstall_resources
   uninstall_plan "$purge"
-  _stop_owned_services
+  _stop_owned_services || die 'Failed to stop Remote Host MCP-owned services; uninstall aborted before payload removal.'
   _remove_owned_file_resource cert_renew_timer
   _remove_owned_file_resource cert_renew_service
   _remove_owned_file_resource tunnel_service_unit

@@ -7,7 +7,27 @@ name = "remote-host-mcp"
 version = "0.2.0a4"
 description = "General-purpose MCP server for AI-controlled remote Linux hosts and containers"
 readme = "README.md"
-requires-python = ">=3.10"
+license = {file = "LICENSE"}
+requires-python = ">=3.10,<3.15"
+authors = [
+  {name = "0ozzzii"},
+]
+keywords = ["mcp", "agent", "linux", "remote-control", "automation", "ssh"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: System Administrators",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: System :: Systems Administration",
+]
 dependencies = [
   "mcp[cli]==2.2.0",
   "pexpect>=4.9,<5",
@@ -20,6 +40,13 @@ dev = [
   "pytest>=8.4,<9",
   "pytest-asyncio>=0.26,<1",
 ]
+
+[project.urls]
+Homepage = "https://github.com/0ozzzii/Remote-Host-MCP"
+Repository = "https://github.com/0ozzzii/Remote-Host-MCP"
+Issues = "https://github.com/0ozzzii/Remote-Host-MCP/issues"
+Documentation = "https://github.com/0ozzzii/Remote-Host-MCP#readme"
+Security = "https://github.com/0ozzzii/Remote-Host-MCP/security"
 
 [project.scripts]
 remote-host-mcp = "remote_host_mcp.main:main"

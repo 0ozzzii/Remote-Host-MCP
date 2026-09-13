@@ -34,12 +34,15 @@ _parse_checkhost_http_result() {
   local expected="$1"
   python3 -c 'import json,sys
 expected=str(int(sys.argv[1])); data=json.load(sys.stdin); statuses=[]
+def walk(x):
+    if isinstance(x, list):
+        if len(x) >= 4 and isinstance(x[3], (int,str)) and str(x[3]).isdigit():
+            statuses.append(str(x[3])); return
+        for item in x: walk(item)
+    elif isinstance(x, dict):
+        for item in x.values(): walk(item)
 for value in data.values():
-    if not value: continue
-    rows=value if isinstance(value,list) else [value]
-    for row in rows:
-        if isinstance(row,list) and row and isinstance(row[0],list): row=row[0]
-        if isinstance(row,list) and len(row)>=4 and row[3] is not None: statuses.append(str(row[3]))
+    if value is not None: walk(value)
 passed=sum(s==expected for s in statuses); blocked=sum(s=="403" for s in statuses)
 print(f"{passed}:{blocked}:{len(statuses)}")' "$expected"
 }
@@ -47,10 +50,16 @@ print(f"{passed}:{blocked}:{len(statuses)}")' "$expected"
 _parse_checkhost_tcp_result() {
   python3 -c 'import json,sys
 d=json.load(sys.stdin); p=c=0
+def has_success(x):
+    if isinstance(x, dict):
+        if "time" in x and x.get("error") in (None, ""): return True
+        return any(has_success(v) for v in x.values())
+    if isinstance(x, list): return any(has_success(v) for v in x)
+    return False
 for v in d.values():
     if v is None: continue
-    c+=1; rows=v if isinstance(v,list) else [v]
-    if any(isinstance(x,dict) and "time" in x for x in rows): p+=1
+    c+=1
+    if has_success(v): p+=1
 print(p,c)'
 }
 
@@ -93,7 +102,7 @@ external_http_probe() {
 
   dispatch="$(_checkhost_dispatch "$target")" || return 2
   request_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("request_id", ""))' <<<"$dispatch" 2>/dev/null || true)"
-  [[ "$request_id" =~ ^[A-Za-z0-9-]+$ ]] || return 2
+  [[ "$request_id" =~ ^[A-Za-z0-9._-]+$ ]] || return 2
   for attempt in 1 2 3 4 5 6; do
     result="$(_checkhost_result "$request_id" 2>/dev/null || true)"
     [[ -n "$result" ]] || { sleep 2; continue; }
@@ -114,7 +123,7 @@ external_tcp_probe() {
   encoded="$(_urlencode "${host}:${port}")"
   dispatch="$(curl -fsS --max-time 12 -H 'Accept: application/json' "https://check-host.net/check-tcp?host=${encoded}&max_nodes=3")" || return 2
   request_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("request_id", ""))' <<<"$dispatch" 2>/dev/null || true)"
-  [[ "$request_id" =~ ^[A-Za-z0-9-]+$ ]] || return 2
+  [[ "$request_id" =~ ^[A-Za-z0-9._-]+$ ]] || return 2
   for attempt in 1 2 3 4 5 6; do
     result="$(curl -fsS --max-time 12 -H 'Accept: application/json' "https://check-host.net/check-result/${request_id}" 2>/dev/null || true)"
     parsed="$(printf '%s' "$result" | _parse_checkhost_tcp_result 2>/dev/null || printf '0 0')"

@@ -1,0 +1,27 @@
+name: Feature request
+description: Propose a new Agent or host-control capability
+title: "[Feature] "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: Describe the Agent workflow or operational limitation rather than only the desired API.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: boundaries
+    attributes:
+      label: Safety and rollback considerations
+      description: Describe expected limits, failure behavior, cleanup, and rollback requirements.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

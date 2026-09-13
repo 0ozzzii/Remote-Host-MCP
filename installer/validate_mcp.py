@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import ssl
-import sys
 import urllib.error
 import urllib.request
 
@@ -16,6 +16,14 @@ if not URL.startswith(("http://127.0.0.1:", "https://")):
     raise SystemExit("validator URL is missing or unsafe")
 
 session_id: str | None = None
+
+
+def _redact(text: str) -> str:
+    text = re.sub(r"(https?://[^/\s]+/mcp/)[A-Za-z0-9._~+/=-]+", r"\1<redacted>", text)
+    text = re.sub(r"(?i)(token|key|secret)([= :]+)[^\s,}\]]+", r"\1\2<redacted>", text)
+    if BEARER:
+        text = text.replace(BEARER, "<redacted>")
+    return text[:300]
 
 
 def _decode_body(raw: bytes) -> dict:
@@ -61,10 +69,10 @@ def rpc(method: str, params: dict | None = None, *, request_id: int | None = 1, 
                 return {}
             doc = _decode_body(raw)
     except urllib.error.HTTPError as exc:
-        safe = exc.read(2048).decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code}: {safe[:300]}") from None
+        safe = _redact(exc.read(2048).decode("utf-8", errors="replace"))
+        raise RuntimeError(f"HTTP {exc.code}: {safe}") from None
     if "error" in doc:
-        raise RuntimeError(f"RPC error: {doc['error']}")
+        raise RuntimeError(f"RPC error: {_redact(json.dumps(doc['error'], ensure_ascii=False))}")
     return doc.get("result", {})
 
 

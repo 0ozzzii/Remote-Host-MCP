@@ -39,7 +39,7 @@ uninstall_plan() {
   _uninstall_print KEEP 'system Nginx/Caddy/Apache, Certbot/Python packages and unrelated services'
   _uninstall_print KEEP 'reused/shared resources and unrelated certificates/DNS records'
   if [[ "$purge" == true ]]; then
-    _uninstall_print REMOVE "owned product config/secrets/hooks: ${CONFIG_DIR:-unknown}"
+    _uninstall_print REMOVE "owned product config/secrets/hooks: ${CONFIG_DIR:-unknown} / ${SECRET_DIR:-unknown}"
     _uninstall_print REMOVE "owned logs/backups: ${LOG_DIR:-unknown} / ${BACKUP_DIR:-unknown}"
     if [[ -n "$cert_name" ]] && resource_owned certificate; then
       if [[ "${RHMCP_PURGE_CERTIFICATES:-0}" == 1 ]]; then
@@ -125,6 +125,12 @@ remove_application_payload() {
   fi
 }
 
+_safe_purge_dir() {
+  local path="$1"
+  [[ -n "$path" && "$path" = /* && "$path" != / ]] || return 1
+  [[ -d "$path" ]] && rm -rf -- "$path"
+}
+
 uninstall_apply() {
   local purge="${1:-false}"
   [[ -n "${CODE_BASE:-}" && "$CODE_BASE" = /* && "$CODE_BASE" != / ]] || die 'Unsafe or missing CODE_BASE; refusing uninstall.'
@@ -149,9 +155,10 @@ uninstall_apply() {
   remove_application_payload
 
   if [[ "$purge" == true ]]; then
-    [[ -n "${LOG_DIR:-}" && "$LOG_DIR" = /* && "$LOG_DIR" != / && -d "$LOG_DIR" ]] && rm -rf -- "$LOG_DIR"
-    [[ -n "${BACKUP_DIR:-}" && "$BACKUP_DIR" = /* && "$BACKUP_DIR" != / && -d "$BACKUP_DIR" ]] && rm -rf -- "$BACKUP_DIR"
-    [[ -d "$CONFIG_DIR" ]] && rm -rf -- "$CONFIG_DIR"
+    _safe_purge_dir "${LOG_DIR:-}" || true
+    _safe_purge_dir "${BACKUP_DIR:-}" || true
+    _safe_purge_dir "${SECRET_DIR:-}" || true
+    _safe_purge_dir "${CONFIG_DIR:-}" || true
     if [[ "${INSTALL_MODE:-}" == prefix ]]; then
       rmdir "$CODE_BASE" >/dev/null 2>&1 || true
     fi
@@ -183,6 +190,7 @@ stray_check() {
   fi
   if [[ "$purge" == true ]]; then
     [[ ! -e "${CONFIG_DIR:-/nonexistent}" ]] || { fail "stray config dir: $CONFIG_DIR"; failures=$((failures+1)); }
+    [[ -z "${SECRET_DIR:-}" || ! -e "$SECRET_DIR" ]] || { fail "stray secret dir: $SECRET_DIR"; failures=$((failures+1)); }
     [[ -z "${STATE_DIR:-}" || ! -e "$STATE_DIR" ]] || { fail "stray state dir: $STATE_DIR"; failures=$((failures+1)); }
     [[ -z "${RUNTIME_DIR:-}" || ! -e "$RUNTIME_DIR" ]] || { fail "stray runtime dir: $RUNTIME_DIR"; failures=$((failures+1)); }
     if [[ "${INSTALL_MODE:-}" == prefix ]]; then

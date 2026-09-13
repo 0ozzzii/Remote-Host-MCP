@@ -4,10 +4,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export RMCP_ROOT="$ROOT"
 # shellcheck disable=SC1091
 source "$ROOT/scripts/lib.sh"
+# shellcheck disable=SC1091
+source "$ROOT/installer/lib/cloudflare.sh"
 cd "$ROOT"
 ensure_dirs
+VERSION="$(tr -d '\r\n' < "$ROOT/VERSION" 2>/dev/null || printf 'unknown')"
 
-header 'Remote Host MCP 0.1.0-alpha.1 - Step 2/2: Cloudflare Tunnel'
+header "Remote Host MCP $VERSION - Step 2/2: Cloudflare Tunnel"
 
 [[ -f .env && -x .venv/bin/python ]] || die 'Local MCP is not bootstrapped. Run: bash scripts/bootstrap.sh'
 
@@ -65,28 +68,11 @@ elif ! "$cf" tunnel run --help 2>&1 | grep -q -- '--token-file'; then
 fi
 
 if [[ "$needs_local" == true ]]; then
-  arch="$(uname -m)"
-  case "$arch" in
-    x86_64|amd64) cf_arch='amd64' ;;
-    aarch64|arm64) cf_arch='arm64' ;;
-    *) fail "$arch"; die 'Unsupported architecture for automatic cloudflared install.' ;;
-  esac
-
-  command -v curl >/dev/null 2>&1 || { fail; die 'curl is required to download cloudflared.'; }
-  tmp="$(mktemp "$RMCP_RUNTIME_DIR/bin/cloudflared.tmp.XXXXXX")"
-  if curl -fL --retry 2 --connect-timeout 10 \
-      -o "$tmp" \
-      "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}" \
-      >/dev/null 2>&1; then
-    chmod 755 "$tmp"
-    mv "$tmp" "$RMCP_RUNTIME_DIR/bin/cloudflared"
-    cf="$RMCP_RUNTIME_DIR/bin/cloudflared"
-    ok "$("$cf" --version 2>&1 | head -1)"
-  else
-    rm -f "$tmp"
+  cf="$(install_pinned_cloudflared "$RMCP_RUNTIME_DIR")" || {
     fail
-    die 'Could not download cloudflared.'
-  fi
+    die "Could not install verified cloudflared ${CLOUDFLARED_PINNED_VERSION}."
+  }
+  ok "$("$cf" --version 2>&1 | head -1)"
 else
   ok "$("$cf" --version 2>&1 | head -1)"
 fi

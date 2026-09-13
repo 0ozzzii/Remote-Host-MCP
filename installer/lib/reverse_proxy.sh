@@ -2,15 +2,9 @@
 set -euo pipefail
 
 detect_proxy() {
-  if command -v nginx >/dev/null 2>&1 && (systemctl is-active nginx >/dev/null 2>&1 || pgrep -x nginx >/dev/null 2>&1); then
-    printf 'nginx\n'; return 0
-  fi
-  if command -v caddy >/dev/null 2>&1 && (systemctl is-active caddy >/dev/null 2>&1 || pgrep -x caddy >/dev/null 2>&1); then
-    printf 'caddy\n'; return 0
-  fi
-  if command -v apache2 >/dev/null 2>&1 && (systemctl is-active apache2 >/dev/null 2>&1 || pgrep -x apache2 >/dev/null 2>&1); then
-    printf 'apache\n'; return 0
-  fi
+  if command -v nginx >/dev/null 2>&1 && (systemctl is-active nginx >/dev/null 2>&1 || pgrep -x nginx >/dev/null 2>&1); then printf 'nginx\n'; return 0; fi
+  if command -v caddy >/dev/null 2>&1 && (systemctl is-active caddy >/dev/null 2>&1 || pgrep -x caddy >/dev/null 2>&1); then printf 'caddy\n'; return 0; fi
+  if command -v apache2 >/dev/null 2>&1 && (systemctl is-active apache2 >/dev/null 2>&1 || pgrep -x apache2 >/dev/null 2>&1); then printf 'apache\n'; return 0; fi
   printf 'none\n'
 }
 
@@ -22,6 +16,61 @@ generate_nginx_snippet() {
 server {
     listen 80;
     server_name ${host};
+    location / { proxy_pass http://127.0.0.1:${port}; }
+}
+EOF2
+}
+
+generate_caddy_block() {
+  local host="$1" port="$2" out="$3"
+  cat > "$out" <<EOF2
+${host} {
+    reverse_proxy 127.0.0.1:${port}
+}
+EOF2
+}
+
+nginx_product_config_path() {
+  if [[ -d /etc/nginx/conf.d ]]; then printf '/etc/nginx/conf.d/remote-host-mcp.conf\n';
+  elif [[ -d /etc/nginx/sites-available ]]; then printf '/etc/nginx/sites-available/remote-host-mcp.conf\n';
+  else return 1; fi
+}
+
+nginx_host_conflict() {
+  local host="$1" ours="$2" file
+  for file in /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/* /etc/nginx/sites-available/*; do
+    [[ -f "$file" && "$file" != "$ours" ]] || continue
+    if grep -Eq "server_name[[:space:]][^;]*($host)([[:space:];]|$)" "$file" 2>/dev/null; then printf '%s\n' "$file"; return 0; fi
+  done
+  return 1
+}
+
+write_managed_nginx_http() {
+  local host="$1" port="$2" webroot="$3" config tmp conflict link=''
+  config="$(nginx_product_config_path)" || return 1
+  conflict="$(nginx_host_conflict "$host" "$config" 2>/dev/null || true)"
+  if [[ -n "$conflict" ]]; then
+    record_resource nginx_site "$conflict" shared
+    fail "Existing Nginx vhost already owns ${host}: ${conflict}. Refusing automatic takeover."
+    return 2
+  fi
+  if [[ -e "$config" ]] && ! managed_file_has_marker "$config"; then
+    fail "Foreign Nginx config occupies product path: $config"
+    return 2
+  fi
+  install -d -m 755 "$webroot/.well-known/acme-challenge"
+  tmp="${config}.tmp.$$"
+  cat > "$tmp" <<EOF2
+# Managed-By: remote-host-mcp
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${host};
+
+    location ^~ /.well-known/acme-challenge/ {
+        root ${webroot};
+        default_type text/plain;
+    }
 
     location / {
         proxy_http_version 1.1;
@@ -35,15 +84,63 @@ server {
     }
 }
 EOF2
+  chmod 644 "$tmp"; mv -f "$tmp" "$config"
+  record_resource nginx_site "$config" created
+  if [[ "$config" == /etc/nginx/sites-available/* ]]; then
+    link="/etc/nginx/sites-enabled/$(basename "$config")"
+    if [[ -e "$link" && ! -L "$link" ]]; then fail "Foreign Nginx enabled path exists: $link"; return 2; fi
+    ln -sfn "$config" "$link"
+    record_resource nginx_site_link "$link" created
+  fi
+  nginx -t
+  if systemd_operational && systemctl is-active nginx >/dev/null 2>&1; then systemctl reload nginx; else nginx -s reload 2>/dev/null || nginx; fi
 }
 
-generate_caddy_block() {
-  local host="$1" port="$2" out="$3"
-  cat > "$out" <<EOF2
-${host} {
-    reverse_proxy 127.0.0.1:${port}
+write_managed_nginx_https() {
+  local host="$1" port="$2" webroot="$3" cert="$4" key="$5" https_port="${6:-443}" config tmp
+  config="$(nginx_product_config_path)" || return 1
+  managed_file_has_marker "$config" || return 2
+  [[ -r "$cert" && -r "$key" ]] || return 1
+  tmp="${config}.tmp.$$"
+  cat > "$tmp" <<EOF2
+# Managed-By: remote-host-mcp
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${host};
+
+    location ^~ /.well-known/acme-challenge/ {
+        root ${webroot};
+        default_type text/plain;
+    }
+    location / { return 308 https://\$host\$request_uri; }
+}
+
+server {
+    listen ${https_port} ssl;
+    listen [::]:${https_port} ssl;
+    server_name ${host};
+    ssl_certificate ${cert};
+    ssl_certificate_key ${key};
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    location / {
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_pass http://127.0.0.1:${port};
+    }
 }
 EOF2
+  chmod 644 "$tmp"; mv -f "$tmp" "$config"
+  nginx -t
+  if systemd_operational && systemctl is-active nginx >/dev/null 2>&1; then systemctl reload nginx; else nginx -s reload; fi
 }
 
 prepare_direct_ingress() {
@@ -76,6 +173,5 @@ prepare_direct_ingress() {
       DIRECT_READY=false
       ;;
   esac
-  REVERSE_PROXY="$proxy"
-  export DIRECT_READY REVERSE_PROXY
+  REVERSE_PROXY="$proxy"; export DIRECT_READY REVERSE_PROXY
 }

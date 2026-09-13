@@ -18,6 +18,22 @@ finally:
 PY
 }
 
+port_listening() {
+  local port="$1"
+  [[ "$port" =~ ^[0-9]+$ && "$port" -ge 1 && "$port" -le 65535 ]] || return 2
+  python3 - "$port" <<'PY'
+import socket, sys
+p=int(sys.argv[1])
+s=socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(0.25)
+try:
+    rc=s.connect_ex(('127.0.0.1', p))
+finally:
+    s.close()
+raise SystemExit(0 if rc == 0 else 1)
+PY
+}
+
 port_owner() {
   local port="$1"
   if command -v ss >/dev/null 2>&1; then

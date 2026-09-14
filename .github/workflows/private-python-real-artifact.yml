@@ -53,7 +53,10 @@ jobs:
 
               install_once() {
                 rm -rf "$install_root"
-                printf '\''2\n1\n2\n%s\n1\ny\n4\n1\n'\'' "$install_root" | \
+                # Language and private-Python choice are preselected by env and do
+                # not consume stdin. Inputs are: prefix mode, root path, root
+                # authority + confirmation, private ingress, capability auth.
+                printf '\''2\n%s\n1\ny\n4\n1\n'\'' "$install_root" | \
                   bash /src/installer/install.sh | tee /tmp/rhmcp-private-install.log
 
                 test -x "$install_root/current/.venv/bin/remote-host-mcp"

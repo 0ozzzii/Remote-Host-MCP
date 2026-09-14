@@ -47,18 +47,47 @@ _private_python_marker_for_root() {
   printf '%s/.rhmcp-private-python.env\n' "${1%/}"
 }
 
+_private_python_musl_loader_present() {
+  if [[ "${RHMCP_TESTING:-0}" == 1 && -n "${RHMCP_PRIVATE_PYTHON_TEST_MUSL_LOADER_PRESENT:-}" ]]; then
+    [[ "$RHMCP_PRIVATE_PYTHON_TEST_MUSL_LOADER_PRESENT" == 1 ]]
+    return
+  fi
+  compgen -G '/lib/ld-musl-*.so.1' >/dev/null 2>&1 || compgen -G '/usr/lib/ld-musl-*.so.1' >/dev/null 2>&1
+}
+
 _private_python_detect_libc_family() {
   local libc=''
   if [[ "${RHMCP_TESTING:-0}" == 1 && -n "${RHMCP_PRIVATE_PYTHON_TEST_LIBC:-}" ]]; then
     printf '%s\n' "$RHMCP_PRIVATE_PYTHON_TEST_LIBC"
     return 0
   fi
-  if command -v getconf >/dev/null 2>&1; then libc="$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"; fi
-  if [[ -z "$libc" ]] && command -v ldd >/dev/null 2>&1; then libc="$(ldd --version 2>&1 | head -n 1 || true)"; fi
-  if printf '%s' "$libc" | grep -qi musl || compgen -G '/lib/ld-musl-*.so.1' >/dev/null 2>&1 || compgen -G '/usr/lib/ld-musl-*.so.1' >/dev/null 2>&1; then
+
+  if command -v getconf >/dev/null 2>&1; then
+    libc="$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+    if printf '%s' "$libc" | grep -qi musl; then
+      printf '%s\n' musl
+      return 0
+    fi
+    if [[ "$libc" == *glibc* || "$libc" == *GLIBC* || "$libc" == *'GNU libc'* || "$libc" == *'GNU C Library'* ]]; then
+      printf '%s\n' gnu
+      return 0
+    fi
+  fi
+
+  if command -v ldd >/dev/null 2>&1; then
+    libc="$(ldd --version 2>&1 | head -n 1 || true)"
+    if printf '%s' "$libc" | grep -qi musl; then
+      printf '%s\n' musl
+      return 0
+    fi
+    if [[ "$libc" == *glibc* || "$libc" == *GLIBC* || "$libc" == *'GNU libc'* || "$libc" == *'GNU C Library'* ]]; then
+      printf '%s\n' gnu
+      return 0
+    fi
+  fi
+
+  if _private_python_musl_loader_present; then
     printf '%s\n' musl
-  elif [[ "$libc" == *glibc* || "$libc" == *GLIBC* || "$libc" == *'GNU libc'* || "$libc" == *'GNU C Library'* ]]; then
-    printf '%s\n' gnu
   else
     printf '%s\n' unknown
   fi

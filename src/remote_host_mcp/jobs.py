@@ -141,6 +141,16 @@ def proc_identity_alive(pid: int | None, start_ticks: int | None) -> bool:
     return current == start_ticks
 
 
+def proc_group_identity_alive(pid: int | None, start_ticks: int | None) -> bool:
+    if not proc_identity_alive(pid, start_ticks):
+        return False
+    assert pid is not None
+    try:
+        return os.getpgid(pid) == pid
+    except (OSError, ProcessLookupError):
+        return False
+
+
 def _safe_child_env() -> dict[str, str]:
     env = dict(os.environ)
     for key in list(env):
@@ -249,7 +259,9 @@ def start_job(
                         created_at=existing.created_at,
                         idempotent_reuse=True,
                     )
-                idem_file.unlink(missing_ok=True)
+                raise ValueError(
+                    "idempotency_key refers to a cleaned durable job and cannot be replayed"
+                )
 
         if _active_job_count(settings) >= settings.max_jobs:
             raise ValueError(f"Active job limit reached ({settings.max_jobs})")
@@ -492,7 +504,7 @@ async def cancel_job(job_id: str, settings: Settings) -> JobStatusResult:
         meta = read_json(job_dir / "metadata.json")
     pid = meta.get("child_pid")
     start_ticks = meta.get("child_start_ticks")
-    if proc_identity_alive(pid, start_ticks):
+    if proc_group_identity_alive(pid, start_ticks):
         # start_new_session=True makes the job leader PID its process-group ID.
         try:
             os.killpg(int(pid), signal.SIGTERM)
@@ -506,13 +518,13 @@ async def cancel_job(job_id: str, settings: Settings) -> JobStatusResult:
             return current
         with job_lock(job_dir):
             meta = read_json(job_dir / "metadata.json")
-        if not proc_identity_alive(meta.get("child_pid"), meta.get("child_start_ticks")):
+        if not proc_group_identity_alive(meta.get("child_pid"), meta.get("child_start_ticks")):
             break
         await asyncio.sleep(0.1)
 
     with job_lock(job_dir):
         meta = read_json(job_dir / "metadata.json")
-    if proc_identity_alive(meta.get("child_pid"), meta.get("child_start_ticks")):
+    if proc_group_identity_alive(meta.get("child_pid"), meta.get("child_start_ticks")):
         try:
             os.killpg(int(meta["child_pid"]), signal.SIGKILL)
         except ProcessLookupError:
@@ -557,7 +569,9 @@ def cleanup_job(job_id: str, settings: Settings) -> JobCleanupResult:
                 try:
                     stored = read_json(mapping)
                     if stored.get("job_id") == job_id:
-                        mapping.unlink(missing_ok=True)
+                        stored["tombstone"] = True
+                        stored["cleaned_at"] = int(time.time())
+                        atomic_json_write(mapping, stored)
                 except ValueError:
                     pass
         shutil.rmtree(job_dir)

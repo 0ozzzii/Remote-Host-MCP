@@ -29,6 +29,28 @@ EXPECTED_TOOLS = {
     "upload_abort",
     "download_info",
     "download_chunk",
+    "file_artifact",
+    "ssh_check",
+    "ssh_exec",
+    "ssh_upload",
+    "ssh_download",
+    "host_capabilities",
+    "wait_condition",
+    "artifact_info",
+    "artifact_preview",
+    "artifact_bundle",
+    "exec_argv",
+    "snapshot_create",
+    "snapshot_list",
+    "snapshot_restore",
+    "snapshot_delete",
+    "lease_acquire",
+    "lease_status",
+    "lease_list",
+    "lease_release",
+    "inspect_paths",
+    "file_diff",
+    "apply_patch",
     "exec",
     "job_run",
     "job_start",
@@ -65,6 +87,17 @@ READ_ONLY_TOOLS = {
     "upload_status",
     "download_info",
     "download_chunk",
+    "file_artifact",
+    "ssh_check",
+    "host_capabilities",
+    "wait_condition",
+    "artifact_info",
+    "artifact_preview",
+    "snapshot_list",
+    "lease_status",
+    "lease_list",
+    "inspect_paths",
+    "file_diff",
     "job_status",
     "job_read",
     "job_list",
@@ -78,7 +111,7 @@ READ_ONLY_TOOLS = {
     "system_info",
 }
 
-OPEN_WORLD_TOOLS = {"exec", "job_run", "job_start", "terminal_exec", "terminal_write"}
+OPEN_WORLD_TOOLS = {"exec", "exec_argv", "job_run", "job_start", "terminal_exec", "terminal_write", "ssh_check", "ssh_exec", "ssh_upload", "ssh_download"}
 
 HIGH_RISK_TOOLS = {
     "write_text_file",
@@ -87,6 +120,13 @@ HIGH_RISK_TOOLS = {
     "remove_path",
     "chmod_path",
     "upload_finish",
+    "ssh_exec",
+    "ssh_upload",
+    "ssh_download",
+    "exec_argv",
+    "snapshot_restore",
+    "snapshot_delete",
+    "apply_patch",
     "exec",
     "job_run",
     "job_start",
@@ -134,7 +174,10 @@ async def test_openai_chatgpt_tool_contract_is_explicit_and_stable(
         assert tool.title and tool.title.strip(), f"{name}: missing title"
         assert tool.description and tool.description.strip(), f"{name}: missing description"
         assert tool.input_schema is not None, f"{name}: missing input schema"
-        assert tool.output_schema is not None, f"{name}: missing output schema"
+        if name == "file_artifact":
+            assert tool.output_schema is None, "file_artifact must remain content-only for native MCP image/resource blocks"
+        else:
+            assert tool.output_schema is not None, f"{name}: missing output schema"
         assert tool.annotations is not None, f"{name}: missing annotations"
 
         annotations = tool.annotations

@@ -8,6 +8,7 @@ import secrets
 import stat
 from pathlib import Path
 
+from .atomic_fs import rename_exchange, rename_noreplace
 from .config import Settings
 from .models import (
     DirectoryEntry,
@@ -96,6 +97,43 @@ def _read_fd_all(fd: int, chunk_size: int = 1024 * 1024) -> bytes:
     return bytes(out)
 
 
+def _hash_fd(fd: int) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    total = 0
+    os.lseek(fd, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(fd, 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+        total += len(chunk)
+    return digest.hexdigest(), total
+
+
+def _content_identity(info: os.stat_result) -> tuple[int, int, int, int]:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+
+def _inode_identity(info: os.stat_result) -> tuple[int, int]:
+    return (info.st_dev, info.st_ino)
+
+
+def _rollback_exchange_if_ours(
+    parent_fd: int,
+    temporary_name: str,
+    destination_name: str,
+    published_inode: tuple[int, int],
+) -> bool:
+    """Roll back an exchange only while our published inode still owns destination."""
+    current = _lstat_at(parent_fd, destination_name)
+    temporary = _lstat_at(parent_fd, temporary_name)
+    if current is None or temporary is None or _inode_identity(current) != published_inode:
+        return False
+    rename_exchange(parent_fd, temporary_name, parent_fd, destination_name)
+    os.fsync(parent_fd)
+    return True
+
+
 def list_directory(path: str | None, limit: int, settings: Settings) -> ListDirectoryResult:
     if limit < 1 or limit > 500:
         raise ValueError("limit must be between 1 and 500")
@@ -160,44 +198,71 @@ def read_text_file(path: str, start_line: int, max_lines: int, max_bytes: int, s
     if max_bytes < 256 or max_bytes > 131072:
         raise ValueError("max_bytes must be between 256 and 131072")
 
+    # Scan in fixed-size chunks. In particular, do not use file iteration/readline:
+    # a hostile single line can otherwise allocate far beyond max_bytes before
+    # the caller's byte budget is applied.
     with opened_beneath(settings, path, os.O_RDONLY) as fd:
         _fstat_regular(fd)
-        pieces: list[bytes] = []
+        output = bytearray()
         used = 0
         returned = 0
+        line_no = 1
+        in_selected_line = False
         truncated = False
-        with os.fdopen(os.dup(fd), "rb", closefd=True) as handle:
-            for lineno, line in enumerate(handle, start=1):
-                if lineno < start_line:
-                    continue
-                if returned >= max_lines:
-                    truncated = True
-                    break
-                remaining = max_bytes - used
-                if remaining <= 0:
-                    truncated = True
-                    break
-                if len(line) > remaining:
-                    pieces.append(line[:remaining])
-                    used += remaining
-                    returned += 1
-                    truncated = True
-                    break
-                pieces.append(line)
-                used += len(line)
-                returned += 1
-            if not truncated and handle.read(1):
-                truncated = True
 
-    text = b"".join(pieces).decode("utf-8", errors="replace")
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            pos = 0
+            while pos < len(chunk):
+                if line_no < start_line:
+                    newline = chunk.find(b"\n", pos)
+                    if newline < 0:
+                        pos = len(chunk)
+                    else:
+                        line_no += 1
+                        pos = newline + 1
+                    continue
+
+                if returned >= max_lines or used >= max_bytes:
+                    truncated = True
+                    break
+
+                if not in_selected_line:
+                    returned += 1
+                    in_selected_line = True
+
+                newline = chunk.find(b"\n", pos)
+                end = len(chunk) if newline < 0 else newline + 1
+                segment = chunk[pos:end]
+                remaining = max_bytes - used
+                if len(segment) > remaining:
+                    output.extend(segment[:remaining])
+                    used += remaining
+                    truncated = True
+                    break
+
+                output.extend(segment)
+                used += len(segment)
+                pos = end
+                if newline >= 0:
+                    line_no += 1
+                    in_selected_line = False
+                    if returned >= max_lines:
+                        if pos < len(chunk) or os.read(fd, 1):
+                            truncated = True
+                        break
+            if truncated:
+                break
+
     return ReadTextFileResult(
         path=str(settings.resolve_allowed_path(path)),
         start_line=start_line,
         lines_returned=returned,
-        text=text,
+        text=bytes(output).decode("utf-8", errors="replace"),
         truncated=truncated,
     )
-
 
 def read_file_chunk(path: str, offset: int, max_bytes: int, settings: Settings) -> ReadFileChunkResult:
     if offset < 0:
@@ -223,23 +288,15 @@ def read_file_chunk(path: str, offset: int, max_bytes: int, settings: Settings) 
 
 
 def hash_file(path: str, settings: Settings) -> HashFileResult:
-    digest = hashlib.sha256()
-    total = 0
     with opened_beneath(settings, path, os.O_RDONLY) as fd:
         _fstat_regular(fd)
-        while True:
-            chunk = os.read(fd, 1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-            total += len(chunk)
+        digest, total = _hash_fd(fd)
     return HashFileResult(
         path=str(settings.resolve_allowed_path(path)),
         algorithm="sha256",
-        digest=digest.hexdigest(),
+        digest=digest,
         bytes_hashed=total,
     )
-
 
 def write_text_file(
     path: str,
@@ -260,20 +317,40 @@ def write_text_file(
             raise ValueError("Destination exists and is not a regular file")
         if existed and not overwrite:
             raise ValueError("Destination exists and overwrite=false")
+
+        expected: str | None = None
+        expected_identity: tuple[int, int, int, int] | None = None
         if expected_sha256 is not None:
             expected = expected_sha256.lower()
             if not _is_sha256(expected):
                 raise ValueError("expected_sha256 must be a 64-character hexadecimal SHA-256")
             if not existed:
                 raise ValueError("expected_sha256 requires an existing destination file")
-            current = hash_file(str(target), settings).digest
-            if current != expected:
+            current_fd = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent_fd,
+            )
+            try:
+                _fstat_regular(current_fd, message="Destination changed and is not a regular file")
+                current_digest, _ = _hash_fd(current_fd)
+                current_info = os.fstat(current_fd)
+                expected_identity = _content_identity(current_info)
+            finally:
+                os.close(current_fd)
+            if current_digest != expected:
                 raise ValueError("Destination SHA-256 no longer matches expected_sha256")
 
         tmp_name = f".{name}.rhmcp-write-{secrets.token_hex(8)}"
         fd: int | None = None
+        preserve_tmp = False
         try:
-            fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), mode, dir_fd=parent_fd)
+            fd = os.open(
+                tmp_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                mode,
+                dir_fd=parent_fd,
+            )
             os.fchmod(fd, mode)
             view = memoryview(data)
             while view:
@@ -282,24 +359,69 @@ def write_text_file(
                     raise OSError("Short write while writing file")
                 view = view[written:]
             os.fsync(fd)
+            new_inode = _inode_identity(os.fstat(fd))
             os.close(fd)
             fd = None
-            # Re-check destination immediately before the atomic commit. A symlink
-            # swapped in after the first check is replaced, never followed.
-            latest = _lstat_at(parent_fd, name)
-            if latest is not None and not overwrite and not existed:
-                raise ValueError("Destination appeared after validation and overwrite=false")
-            if latest is not None and not (stat.S_ISREG(latest.st_mode) or stat.S_ISLNK(latest.st_mode)):
-                raise ValueError("Destination changed to an unsupported file type")
-            os.replace(tmp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+
+            if expected is not None:
+                # RENAME_EXCHANGE makes the exact object that was replaced
+                # available under tmp_name. Verify that object, not a pathname
+                # observed before the commit. If a concurrent writer won the
+                # race, exchange back so their version remains the destination.
+                try:
+                    rename_exchange(parent_fd, tmp_name, parent_fd, name)
+                except OSError as exc:
+                    if exc.errno == errno.ENOENT:
+                        raise ValueError("Destination disappeared during expected_sha256 guarded replacement") from exc
+                    raise
+                try:
+                    old_entry = _lstat_at(parent_fd, tmp_name)
+                    if (
+                        old_entry is None
+                        or not stat.S_ISREG(old_entry.st_mode)
+                        or _content_identity(old_entry) != expected_identity
+                    ):
+                        raise ValueError("Destination changed during expected_sha256 guarded replacement")
+                    old_fd = os.open(
+                        tmp_name,
+                        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                        dir_fd=parent_fd,
+                    )
+                    try:
+                        old_info = _fstat_regular(old_fd, message="Destination changed during guarded replacement")
+                        old_digest, _ = _hash_fd(old_fd)
+                        old_identity = _content_identity(old_info)
+                    finally:
+                        os.close(old_fd)
+                    if old_digest != expected or old_identity != expected_identity:
+                        raise ValueError("Destination changed during expected_sha256 guarded replacement")
+                except Exception as exc:
+                    if not _rollback_exchange_if_ours(parent_fd, tmp_name, name, new_inode):
+                        # Never unlink an object belonging to an unknown concurrent
+                        # writer. Keep the exchanged entry for operator recovery.
+                        preserve_tmp = True
+                    if isinstance(exc, ValueError) and str(exc) == "Destination changed during expected_sha256 guarded replacement":
+                        raise
+                    raise ValueError("Destination changed during expected_sha256 guarded replacement") from exc
+                os.unlink(tmp_name, dir_fd=parent_fd)
+            elif overwrite:
+                os.replace(tmp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            else:
+                try:
+                    rename_noreplace(parent_fd, tmp_name, parent_fd, name)
+                except OSError as exc:
+                    if exc.errno == errno.EEXIST:
+                        raise ValueError("Destination appeared during commit and overwrite=false") from exc
+                    raise
             os.fsync(parent_fd)
         finally:
             if fd is not None:
                 os.close(fd)
-            try:
-                os.unlink(tmp_name, dir_fd=parent_fd)
-            except FileNotFoundError:
-                pass
+            if not preserve_tmp:
+                try:
+                    os.unlink(tmp_name, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
 
     return FileWriteResult(
         success=True,
@@ -310,7 +432,6 @@ def write_text_file(
         atomic=True,
         replaced=existed,
     )
-
 
 def _root_for_lexical(path: Path, settings: Settings) -> tuple[Path, tuple[str, ...]]:
     for root in settings.allowed_roots:
@@ -357,7 +478,7 @@ def make_directory(path: str, parents: bool, exist_ok: bool, mode: int, settings
                     os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
                     dir_fd=current_fd,
                 )
-                if last and (created or exist_ok):
+                if last and created:
                     os.fchmod(next_fd, mode)
             if current_fd != root_fd:
                 os.close(current_fd)
@@ -393,29 +514,84 @@ def move_path(source: str, destination: str, overwrite: bool, settings: Settings
         if src_stat is None:
             raise ValueError("Source does not exist")
         with opened_parent_beneath(settings, destination) as (dst_fd, dst_name, dst_path):
+            if src_path == dst_path:
+                return PathActionResult(success=True, action="move", path=str(src_path), destination=str(dst_path))
+
             dst_stat = _lstat_at(dst_fd, dst_name)
+            if dst_stat is None:
+                try:
+                    rename_noreplace(src_fd, src_name, dst_fd, dst_name)
+                    os.fsync(dst_fd)
+                    if src_fd != dst_fd:
+                        os.fsync(src_fd)
+                    return PathActionResult(success=True, action="move", path=str(src_path), destination=str(dst_path))
+                except OSError as exc:
+                    if exc.errno == errno.EXDEV:
+                        raise ValueError("Secure cross-filesystem move is not supported; copy then remove explicitly") from exc
+                    if exc.errno != errno.EEXIST:
+                        raise
+                    dst_stat = _lstat_at(dst_fd, dst_name)
+
             if dst_stat is not None and not overwrite:
                 raise ValueError("Destination exists and overwrite=false")
-            if dst_stat is not None:
-                if stat.S_ISDIR(dst_stat.st_mode) != stat.S_ISDIR(src_stat.st_mode):
-                    raise ValueError("Source and destination types are incompatible")
-                if stat.S_ISDIR(dst_stat.st_mode):
-                    check_fd = os.open(dst_name, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0), dir_fd=dst_fd)
-                    try:
-                        if os.listdir(check_fd):
-                            raise ValueError("Refusing to overwrite a non-empty destination directory")
-                    finally:
-                        os.close(check_fd)
-                    os.rmdir(dst_name, dir_fd=dst_fd)
+            if dst_stat is None:
+                raise ValueError("Destination changed during move")
+            if stat.S_ISDIR(dst_stat.st_mode) != stat.S_ISDIR(src_stat.st_mode):
+                raise ValueError("Source and destination types are incompatible")
+            if stat.S_ISDIR(dst_stat.st_mode):
+                check_fd = os.open(
+                    dst_name,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=dst_fd,
+                )
+                try:
+                    if os.listdir(check_fd):
+                        raise ValueError("Refusing to overwrite a non-empty destination directory")
+                finally:
+                    os.close(check_fd)
+
+            src_inode = _inode_identity(src_stat)
+            dst_inode = _inode_identity(dst_stat)
             try:
-                os.replace(src_name, dst_name, src_dir_fd=src_fd, dst_dir_fd=dst_fd)
+                rename_exchange(src_fd, src_name, dst_fd, dst_name)
             except OSError as exc:
                 if exc.errno == errno.EXDEV:
                     raise ValueError("Secure cross-filesystem move is not supported; copy then remove explicitly") from exc
                 raise
+            exchanged_old = _lstat_at(src_fd, src_name)
+            if exchanged_old is None or _inode_identity(exchanged_old) != dst_inode:
+                current_dst = _lstat_at(dst_fd, dst_name)
+                current_src = _lstat_at(src_fd, src_name)
+                if (
+                    current_dst is not None
+                    and current_src is not None
+                    and _inode_identity(current_dst) == src_inode
+                ):
+                    rename_exchange(src_fd, src_name, dst_fd, dst_name)
+                    os.fsync(dst_fd)
+                    if src_fd != dst_fd:
+                        os.fsync(src_fd)
+                raise ValueError("Destination changed during move commit")
+            try:
+                _remove_tree_at(src_fd, src_name)
+            except Exception:
+                current_dst = _lstat_at(dst_fd, dst_name)
+                current_src = _lstat_at(src_fd, src_name)
+                if (
+                    current_dst is not None
+                    and current_src is not None
+                    and _inode_identity(current_dst) == src_inode
+                    and _inode_identity(current_src) == dst_inode
+                ):
+                    rename_exchange(src_fd, src_name, dst_fd, dst_name)
+                    os.fsync(dst_fd)
+                    if src_fd != dst_fd:
+                        os.fsync(src_fd)
+                raise
             os.fsync(dst_fd)
+            if src_fd != dst_fd:
+                os.fsync(src_fd)
     return PathActionResult(success=True, action="move", path=str(src_path), destination=str(dst_path))
-
 
 def _copy_file_at(src_parent: int, src_name: str, dst_parent: int, dst_name: str, mode: int) -> None:
     src_fd = os.open(src_name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=src_parent)
@@ -477,26 +653,72 @@ def copy_path(source: str, destination: str, recursive: bool, overwrite: bool, s
         if stat.S_ISDIR(src_stat.st_mode) and not recursive:
             raise ValueError("Source is a directory; recursive=true is required")
         with opened_parent_beneath(settings, destination) as (dst_fd, dst_name, dst_path):
-            dst_stat = _lstat_at(dst_fd, dst_name)
-            if dst_stat is not None:
-                if not overwrite:
-                    raise ValueError("Destination exists and overwrite=false")
-                if stat.S_ISDIR(dst_stat.st_mode):
-                    _remove_tree_at(dst_fd, dst_name)
-                else:
-                    os.unlink(dst_name, dir_fd=dst_fd)
-            try:
-                _copy_tree_at(src_fd, src_name, dst_fd, dst_name)
-            except Exception:
-                try:
-                    if _lstat_at(dst_fd, dst_name) is not None:
-                        _remove_tree_at(dst_fd, dst_name)
-                except OSError:
-                    pass
-                raise
-            os.fsync(dst_fd)
-    return PathActionResult(success=True, action="copy", path=str(src_path), destination=str(dst_path))
+            if src_path == dst_path:
+                raise ValueError("Source and destination must differ")
+            initial_dst = _lstat_at(dst_fd, dst_name)
+            if initial_dst is not None and not overwrite:
+                raise ValueError("Destination exists and overwrite=false")
 
+            staging_name = f".{dst_name}.rhmcp-copy-{secrets.token_hex(8)}.tmp"
+            committed = False
+            preserve_staging = False
+            try:
+                # Build the complete copy beside the destination. A failed copy
+                # can therefore never destroy the previous destination.
+                _copy_tree_at(src_fd, src_name, dst_fd, staging_name)
+                staged = _lstat_at(dst_fd, staging_name)
+                if staged is None:
+                    raise RuntimeError("Staged copy disappeared before commit")
+                staged_inode = _inode_identity(staged)
+                os.fsync(dst_fd)
+
+                current_dst = _lstat_at(dst_fd, dst_name)
+                if current_dst is None:
+                    try:
+                        rename_noreplace(dst_fd, staging_name, dst_fd, dst_name)
+                        committed = True
+                    except OSError as exc:
+                        if exc.errno != errno.EEXIST:
+                            raise
+                        current_dst = _lstat_at(dst_fd, dst_name)
+                if not committed:
+                    if current_dst is None:
+                        raise ValueError("Destination changed during copy commit")
+                    if not overwrite:
+                        raise ValueError("Destination appeared during copy and overwrite=false")
+                    expected_old_inode = _inode_identity(current_dst)
+                    rename_exchange(dst_fd, staging_name, dst_fd, dst_name)
+                    committed = True
+                    exchanged_old = _lstat_at(dst_fd, staging_name)
+                    if exchanged_old is None or _inode_identity(exchanged_old) != expected_old_inode:
+                        if _rollback_exchange_if_ours(dst_fd, staging_name, dst_name, staged_inode):
+                            committed = False
+                        else:
+                            preserve_staging = True
+                        raise ValueError("Destination changed during copy commit")
+                    try:
+                        _remove_tree_at(dst_fd, staging_name)
+                    except Exception:
+                        # Restore the old destination if the just-published copy is
+                        # still exactly the object we staged. Never delete an
+                        # unknown concurrent writer merely to make cleanup succeed.
+                        now = _lstat_at(dst_fd, dst_name)
+                        old = _lstat_at(dst_fd, staging_name)
+                        if now is not None and old is not None and _inode_identity(now) == staged_inode:
+                            rename_exchange(dst_fd, staging_name, dst_fd, dst_name)
+                            committed = False
+                        else:
+                            preserve_staging = True
+                        raise
+                os.fsync(dst_fd)
+            finally:
+                if not committed and not preserve_staging:
+                    try:
+                        if _lstat_at(dst_fd, staging_name) is not None:
+                            _remove_tree_at(dst_fd, staging_name)
+                    except OSError:
+                        pass
+    return PathActionResult(success=True, action="copy", path=str(src_path), destination=str(dst_path))
 
 def remove_path(path: str, recursive: bool, settings: Settings) -> PathActionResult:
     target = Path(os.path.normpath(str(Path(path).expanduser())))

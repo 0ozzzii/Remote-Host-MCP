@@ -27,6 +27,8 @@ class StatusResult(BaseModel):
     online: bool
     service: str
     version: str
+    build_commit: str | None = None
+    build_ref: str | None = None
     hostname: str
     pid: int
     user: str
@@ -331,6 +333,11 @@ class ProcessSignalResult(BaseModel):
 class ServiceStatusResult(BaseModel):
     service: str
     available: bool
+    systemctl_present: bool = False
+    pid1_is_systemd: bool | None = None
+    manager_reachable: bool = False
+    operational: bool = False
+    reason: str | None = None
     active_state: str | None = None
     sub_state: str | None = None
     unit_file_state: str | None = None
@@ -345,6 +352,47 @@ class ServiceActionResult(BaseModel):
     return_code: int | None = None
     output: str = ""
     status: ServiceStatusResult
+
+
+class SshCheckResult(BaseModel):
+    success: bool
+    host: str
+    port: int | None = Field(default=None, ge=1, le=65535)
+    user: str | None = None
+    duration_ms: int = Field(ge=0)
+    error: ToolErrorInfo | None = None
+
+
+class SshExecResult(BaseModel):
+    success: bool
+    host: str
+    port: int | None = Field(default=None, ge=1, le=65535)
+    user: str | None = None
+    exit_code: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    duration_ms: int = Field(ge=0)
+    timed_out: bool = False
+    terminated_by: str | None = None
+    truncated: bool = False
+    output_bytes_returned: int = Field(default=0, ge=0)
+    output_bytes_total: int = Field(default=0, ge=0)
+    error: ToolErrorInfo | None = None
+
+
+class SshTransferResult(BaseModel):
+    success: bool
+    direction: str
+    host: str
+    port: int | None = Field(default=None, ge=1, le=65535)
+    user: str | None = None
+    local_path: str
+    remote_path: str
+    bytes_transferred: int = Field(ge=0)
+    sha256: str | None = None
+    duration_ms: int = Field(ge=0)
+    replaced: bool = False
+    error: ToolErrorInfo | None = None
 
 
 class SystemInfoResult(BaseModel):

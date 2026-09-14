@@ -1,0 +1,104 @@
+name: Remote Host MCP private Python real artifact validation
+
+on:
+  pull_request:
+    paths:
+      - "installer/lib/private_python.sh"
+      - "installer/lib/common.sh"
+      - "installer/lib/lifecycle.sh"
+      - "tests/test_private_python_bootstrap.py"
+      - ".github/workflows/private-python-real-artifact.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python39-clean-container-real-artifact:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Real CPython artifact on Python 3.9-only clean container lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -e EXPECTED_SHA="$EXPECTED_SHA" \
+            -v "$GITHUB_WORKSPACE:/src:ro" \
+            python:3.9-slim-bookworm bash -lc '
+              set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y --no-install-recommends \
+                ca-certificates curl tar openssl openssh-client procps iproute2
+
+              system_python="$(python3 -c '\''import sys; print(".".join(map(str, sys.version_info[:3])))'\'')"
+              echo "SYSTEM_PYTHON=$system_python"
+              case "$system_python" in 3.9.*) ;; *) echo "Expected Python 3.9-only container, got $system_python" >&2; exit 2 ;; esac
+
+              export RHMCP_LANGUAGE=en_US
+              export RHMCP_PYTHON_BIN=
+              export RHMCP_PYTHON_CANDIDATES="$(command -v python3)"
+              export RHMCP_PRIVATE_PYTHON_CHOICE=1
+              export RHMCP_RESOLVED_COMMIT="$EXPECTED_SHA"
+              export RHMCP_REQUESTED_REF="$EXPECTED_SHA"
+              install_root=/opt/rhmcp-real-private-python
+
+              install_once() {
+                rm -rf "$install_root"
+                # Language and private-Python choice are preselected by env and do
+                # not consume stdin. Inputs are: prefix mode, root path, root
+                # authority + confirmation, private ingress, capability auth.
+                printf '\''2\n%s\n1\ny\n4\n1\n'\'' "$install_root" | \
+                  bash /src/installer/install.sh | tee /tmp/rhmcp-private-install.log
+
+                test -x "$install_root/current/.venv/bin/remote-host-mcp"
+                test -x "$install_root/runtime/private-python-3.11.16/python/bin/python3"
+                test "$("$install_root/runtime/private-python-3.11.16/python/bin/python3" -c '\''import sys; print(".".join(map(str, sys.version_info[:3])))'\'')" = 3.11.16
+                test "$(python3 -c '\''import sys; print(".".join(map(str, sys.version_info[:2])))'\'')" = 3.9
+
+                grep -q "^RHMCP_PRIVATE_PYTHON_VERSION=3.11.16$" "$install_root/runtime/private-python-3.11.16/.rhmcp-private-python.env"
+                grep -q "^RHMCP_PRIVATE_PYTHON_SHA256=64427febea27864d136db46c8efe968eb6fa5ca2813ce1dca4bb95aec31cb2e4$" "$install_root/runtime/private-python-3.11.16/.rhmcp-private-python.env"
+                grep -q "^RESOURCE_PRIVATE_PYTHON_OWNERSHIP=created$" "$install_root/config/resource-ownership.env"
+                grep -q "^RHMCP_BUILD_COMMIT=$EXPECTED_SHA$" "$install_root/config/install-state.env"
+                grep -q "/mcp/<redacted>" /tmp/rhmcp-private-install.log
+                ! grep -q "RHMCP_PATH_KEY=" /tmp/rhmcp-private-install.log
+
+                curl -fsS http://127.0.0.1:8765/health >/tmp/rhmcp-private-health.json
+                rmcp status
+                rmcp doctor
+                rmcp repair
+                rmcp doctor
+                rmcp uninstall --dry-run
+
+                private_python_mib="$(du -sm "$install_root/runtime/private-python-3.11.16" | awk '\''{print $1}'\'')"
+                venv_mib="$(du -sm "$install_root/current/.venv" | awk '\''{print $1}'\'')"
+                install_tree_mib="$(du -sm "$install_root" | awk '\''{print $1}'\'')"
+                server_pid="$(cat "$install_root/logs/server.pid")"
+                server_rss_kib="$(ps -o rss= -p "$server_pid" | tr -d " ")"
+                echo "PRIVATE_PYTHON_REAL_ARTIFACT_RESOURCE_SNAPSHOT private_python_mib=${private_python_mib} venv_mib=${venv_mib} install_tree_mib=${install_tree_mib} server_rss_kib=${server_rss_kib}"
+                test "$private_python_mib" -gt 0
+                test "$venv_mib" -gt 0
+                test "$install_tree_mib" -gt 0
+                test "$server_rss_kib" -gt 0
+              }
+
+              install_once
+              RHMCP_ASSUME_YES=1 rmcp uninstall --purge
+              test ! -e "$install_root"
+              ! command -v rmcp >/dev/null 2>&1
+              test "$(python3 -c '\''import sys; print(".".join(map(str, sys.version_info[:2])))'\'')" = 3.9
+
+              install_once
+              RHMCP_ASSUME_YES=1 rmcp uninstall --purge
+              test ! -e "$install_root"
+              ! command -v rmcp >/dev/null 2>&1
+              test "$(python3 -c '\''import sys; print(".".join(map(str, sys.version_info[:2])))'\'')" = 3.9
+            '

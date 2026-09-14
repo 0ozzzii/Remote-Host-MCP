@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import os
 
+from .config import ConfigError
+
 _SUFFIXES = (
     "AUTH_MODE",
     "PATH_KEY",
@@ -49,14 +51,36 @@ _SUFFIXES = (
 )
 
 
-def apply_env_compat() -> None:
-    """Map RHMCP_* to the legacy DSW_MCP_* implementation namespace.
-
-    This is intentionally one-way. A deployed DSW profile can keep its existing
-    DSW_MCP_* file unchanged, while new generic installations use RHMCP_*.
-    """
+def env_namespace_summary() -> dict[str, str]:
+    """Report only namespace provenance, never configuration values."""
+    summary: dict[str, str] = {}
     for suffix in _SUFFIXES:
         generic = f"RHMCP_{suffix}"
         legacy = f"DSW_MCP_{suffix}"
-        if legacy not in os.environ and generic in os.environ:
-            os.environ[legacy] = os.environ[generic]
+        generic_value = os.environ.get(generic)
+        legacy_value = os.environ.get(legacy)
+        if generic_value is not None and legacy_value is not None:
+            summary[suffix] = "both-equal" if generic_value == legacy_value else "conflict"
+        elif generic_value is not None:
+            summary[suffix] = "RHMCP"
+        elif legacy_value is not None:
+            summary[suffix] = "DSW_MCP"
+        else:
+            summary[suffix] = "default"
+    return summary
+
+
+def apply_env_compat() -> None:
+    """Map RHMCP_* to legacy names only when the mapping is unambiguous."""
+    for suffix in _SUFFIXES:
+        generic = f"RHMCP_{suffix}"
+        legacy = f"DSW_MCP_{suffix}"
+        generic_value = os.environ.get(generic)
+        legacy_value = os.environ.get(legacy)
+        if generic_value is not None and legacy_value is not None and generic_value != legacy_value:
+            raise ConfigError(
+                f"Conflicting configuration: {generic} and {legacy} are both set differently; "
+                "remove one namespace or make the values identical"
+            )
+        if legacy_value is None and generic_value is not None:
+            os.environ[legacy] = generic_value

@@ -3,11 +3,11 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from typing import Annotated
+from typing import Annotated, Literal
 
 from mcp.server import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
-from mcp.types import ToolAnnotations
+from mcp.types import EmbeddedResource, ImageContent, TextContent, ToolAnnotations
 from pydantic import Field
 
 from .auth import build_oauth_components
@@ -33,6 +33,9 @@ from .models import (
     ProcessSignalResult,
     ServiceActionResult,
     ServiceStatusResult,
+    SshCheckResult,
+    SshExecResult,
+    SshTransferResult,
     SystemInfoResult,
     TerminalActionResult,
     TerminalExecResult,
@@ -50,6 +53,14 @@ from .system_helpers import (
     service_action as service_action_impl,
     service_status as service_status_impl,
     system_info as system_info_impl,
+)
+from .artifact_helpers import file_artifact as file_artifact_impl
+from .agent_surface import register_agent_ops
+from .ssh_helpers import (
+    ssh_check as ssh_check_impl,
+    ssh_download as ssh_download_impl,
+    ssh_exec as ssh_exec_impl,
+    ssh_upload as ssh_upload_impl,
 )
 from .tasks_extension import DurableJobsTasksExtension
 from .terminal import TerminalManager
@@ -289,7 +300,7 @@ def build_server(settings: Settings) -> MCPServer:
     )
     async def terminal_signal(
         terminal_id: Annotated[str, Field(min_length=32, max_length=32, description="PTY handle.")],
-        signal_name: Annotated[str, Field(description="INT, QUIT, TSTP, TERM, HUP, or CONT.")],
+        signal_name: Annotated[Literal["INT", "QUIT", "TSTP", "TERM", "HUP", "CONT", "SIGINT", "SIGQUIT", "SIGTSTP", "SIGTERM", "SIGHUP", "SIGCONT"], Field(description="Validated terminal signal.")],
     ) -> TerminalActionResult:
         """Deliver a terminal control signal such as Ctrl+C/SIGINT to the foreground group."""
         return await terminal_manager.signal(terminal_id, signal_name)
@@ -313,6 +324,89 @@ def build_server(settings: Settings) -> MCPServer:
     ) -> TerminalActionResult:
         """Close one PTY session and its shell; use job_start/job_run for calculations that must outlive a terminal."""
         return await terminal_manager.close(terminal_id)
+
+    # ------------------------- Artifacts / SSH -------------------------
+    @mcp.tool(
+        title="Return host file to the MCP client",
+        annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False),
+        structured_output=False,
+    )
+    async def file_artifact(
+        path: Annotated[str, Field(description="Absolute regular-file path inside RHMCP_ALLOWED_ROOTS.")],
+        max_bytes: Annotated[int, Field(ge=1, le=8388608, description="Maximum raw bytes returned inline. Larger files should use download_info/download_chunk.")] = 4194304,
+    ) -> list[TextContent | ImageContent | EmbeddedResource]:
+        """Return raster images as MCP ImageContent and other small binary files as embedded resources."""
+        return file_artifact_impl(path, max_bytes, settings)
+
+    @mcp.tool(
+        title="Check preconfigured SSH target",
+        annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True),
+        structured_output=True,
+    )
+    async def ssh_check(
+        host: Annotated[str, Field(min_length=1, max_length=253, description="SSH config alias, DNS hostname, or IP address. Host keys and credentials must already be provisioned on the MCP host.")],
+        user: Annotated[str | None, Field(description="Optional SSH username; normally omit when the SSH config alias already supplies User.")] = None,
+        port: Annotated[int | None, Field(ge=1, le=65535, description="Optional SSH port; normally omit when the SSH config alias already supplies Port.")] = None,
+        connect_timeout_seconds: Annotated[int, Field(ge=1, le=30, description="TCP/SSH connection timeout.")] = 10,
+    ) -> SshCheckResult:
+        """Verify a strict, noninteractive OpenSSH connection. Password prompts and unknown host keys fail closed."""
+        return await ssh_check_impl(host, user, port, connect_timeout_seconds, settings)
+
+    @mcp.tool(
+        title="Run command through strict OpenSSH",
+        annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=True),
+        structured_output=True,
+    )
+    async def ssh_exec(
+        host: Annotated[str, Field(min_length=1, max_length=253, description="Preconfigured SSH target alias, DNS hostname, or IP address.")],
+        command: Annotated[str, Field(min_length=1, description="Remote shell command. Sent over SSH stdin so command text is not placed in the local ssh process argv.")],
+        user: Annotated[str | None, Field(description="Optional SSH username.")] = None,
+        port: Annotated[int | None, Field(ge=1, le=65535, description="Optional SSH port.")] = None,
+        connect_timeout_seconds: Annotated[int, Field(ge=1, le=30, description="SSH connection timeout.")] = 10,
+        timeout_ms: Annotated[int | None, Field(description="Remote command deadline, bounded by the synchronous execution limit.")] = None,
+    ) -> SshExecResult:
+        """Execute once via system OpenSSH using BatchMode and strict host-key checking; no password/key material is accepted by this tool."""
+        return await ssh_exec_impl(host, user, port, command, connect_timeout_seconds, timeout_ms, settings)
+
+    @mcp.tool(
+        title="Upload allowed local file over strict SCP",
+        annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=True),
+        structured_output=True,
+    )
+    async def ssh_upload(
+        host: Annotated[str, Field(min_length=1, max_length=253, description="Preconfigured SSH target.")],
+        local_path: Annotated[str, Field(description="Regular source file inside RHMCP_ALLOWED_ROOTS.")],
+        remote_path: Annotated[str, Field(description="Absolute conservative POSIX destination path on the SSH target.")],
+        user: Annotated[str | None, Field(description="Optional SSH username.")] = None,
+        port: Annotated[int | None, Field(ge=1, le=65535, description="Optional SSH port.")] = None,
+        connect_timeout_seconds: Annotated[int, Field(ge=1, le=30, description="SSH connection timeout.")] = 10,
+        timeout_ms: Annotated[int, Field(ge=1000, le=3600000, description="Transfer deadline.")] = 300000,
+        overwrite: Annotated[bool, Field(description="Permit atomic replacement of an existing remote destination.")] = False,
+    ) -> SshTransferResult:
+        """Freeze the local source, SCP to remote staging, publish, then verify SHA-256."""
+        return await ssh_upload_impl(host, user, port, local_path, remote_path, connect_timeout_seconds, timeout_ms, overwrite, settings)
+
+    @mcp.tool(
+        title="Download remote file over strict SCP",
+        annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=True),
+        structured_output=True,
+    )
+    async def ssh_download(
+        host: Annotated[str, Field(min_length=1, max_length=253, description="Preconfigured SSH target.")],
+        remote_path: Annotated[str, Field(description="Absolute conservative POSIX source path on the SSH target.")],
+        local_path: Annotated[str, Field(description="Final destination inside RHMCP_ALLOWED_ROOTS.")],
+        user: Annotated[str | None, Field(description="Optional SSH username.")] = None,
+        port: Annotated[int | None, Field(ge=1, le=65535, description="Optional SSH port.")] = None,
+        connect_timeout_seconds: Annotated[int, Field(ge=1, le=30, description="SSH connection timeout.")] = 10,
+        timeout_ms: Annotated[int, Field(ge=1000, le=3600000, description="Transfer deadline.")] = 300000,
+        overwrite: Annotated[bool, Field(description="Permit atomic replacement of an existing local regular file.")] = False,
+        mode: Annotated[int, Field(ge=0, le=511, description="Final local POSIX permission bits.")] = 420,
+    ) -> SshTransferResult:
+        """Check remote size/hash, SCP to private staging, verify SHA-256, then publish inside allowed roots."""
+        return await ssh_download_impl(host, user, port, remote_path, local_path, connect_timeout_seconds, timeout_ms, overwrite, mode, settings)
+
+    # ------------------------- Agent-native planning / safety -------------------------
+    register_agent_ops(mcp, settings)
 
     # ------------------------- Process / service / system -------------------------
     @mcp.tool(
@@ -345,7 +439,7 @@ def build_server(settings: Settings) -> MCPServer:
     async def process_signal(
         pid: Annotated[int, Field(gt=0, description="Exact Linux PID.")],
         expected_start_ticks: Annotated[int, Field(ge=0, description="start_ticks previously returned by process_info.")],
-        signal_name: Annotated[str, Field(description="INT, HUP, TERM, KILL, STOP, or CONT.")],
+        signal_name: Annotated[Literal["INT", "HUP", "TERM", "KILL", "STOP", "CONT", "SIGINT", "SIGHUP", "SIGTERM", "SIGKILL", "SIGSTOP", "SIGCONT"], Field(description="Validated process signal.")],
     ) -> ProcessSignalResult:
         """Signal one exact process using PID+starttime and pidfd when the kernel permits it."""
         return process_signal_impl(pid, expected_start_ticks, signal_name)
@@ -368,7 +462,7 @@ def build_server(settings: Settings) -> MCPServer:
     )
     async def service_action(
         service: Annotated[str, Field(min_length=1, max_length=200, description="Exact systemd unit/service name.")],
-        action: Annotated[str, Field(description="start, stop, or restart.")],
+        action: Annotated[Literal["start", "stop", "restart"], Field(description="Validated systemd action.")],
     ) -> ServiceActionResult:
         """Run one validated systemctl action without shell expansion or fuzzy process matching."""
         return service_action_impl(service, action)

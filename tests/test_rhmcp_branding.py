@@ -41,7 +41,7 @@ async def test_canonical_app_has_generic_identity_and_tool_copy(
         listed = await client.list_tools()
         status = await client.call_tool("status", {})
 
-    assert len(listed.tools) == 43
+    assert len(listed.tools) == 65
     visible = _model_visible_text(
         [
             {
@@ -59,7 +59,7 @@ async def test_canonical_app_has_generic_identity_and_tool_copy(
 
     assert status.structured_content is not None
     assert status.structured_content["service"] == PRODUCT_NAME
-    assert status.structured_content["version"] == "0.2.0a1"
+    assert status.structured_content["version"] == "0.2.0a4"
 
 
 def test_canonical_health_route_replaces_legacy_route(

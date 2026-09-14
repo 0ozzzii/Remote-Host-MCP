@@ -8,13 +8,28 @@ source "$SELF_DIR/lib/common.sh"
 source "$SELF_DIR/lib/ports.sh"
 source "$SELF_DIR/lib/paths.sh"
 source "$SELF_DIR/lib/state.sh"
+source "$SELF_DIR/lib/readiness.sh"
+source "$SELF_DIR/lib/lifecycle.sh"
+source "$SELF_DIR/lib/external_probe.sh"
 source "$SELF_DIR/lib/cloudflare.sh"
+source "$SELF_DIR/lib/dns_provider.sh"
+source "$SELF_DIR/lib/domain_mode.sh"
 source "$SELF_DIR/lib/reverse_proxy.sh"
+source "$SELF_DIR/lib/tls.sh"
+source "$SELF_DIR/lib/port_hardening.sh"
+source "$SELF_DIR/lib/uninstall.sh"
 
 RMCP_VERSION="$(tr -d '\r\n' < "$SOURCE_ROOT/VERSION")"
+ACTION='install'
+RESUME_MODE=false
+RESUME_FROM_STAGE='NONE'
 AUTHORITY='user'
 INGRESS=''
+DOMAIN_DNS_MODE='unknown'
+DOMAIN_CHALLENGE_MODE='auto'
 PUBLIC_HOST='mcp.invalid'
+PUBLIC_HTTPS_PORT='443'
+HTTPS_LISTEN_PORT='443'
 LOCAL_PORT='8765'
 SERVICE_BACKEND='portable'
 SERVICE_USER="$(id -un)"
@@ -25,6 +40,84 @@ OAUTH_ISSUER=''
 OAUTH_JWKS_URL=''
 OAUTH_AUDIENCE=''
 OAUTH_SCOPES='remote-host'
+ACME_EMAIL=''
+LAST_COMPLETED_STAGE='NONE'
+LAST_ERROR_CLASS='INSTALLER_FAILURE'
+INSTALL_TRACKING=false
+INSTALL_COMPLETE=false
+PROMOTED=false
+LOCAL_VALIDATED=false
+
+parse_args() {
+  while (($#)); do
+    case "$1" in
+      --resume) ACTION=resume ;;
+      --repair) ACTION=repair ;;
+      --diagnose) ACTION=diagnose ;;
+      --uninstall-incomplete) ACTION=uninstall-incomplete ;;
+      --help|-h)
+        printf 'Usage: install.sh [--resume|--repair|--diagnose|--uninstall-incomplete]\n'
+        exit 0
+        ;;
+      *) die "Unknown installer argument: $1" ;;
+    esac
+    shift
+  done
+}
+
+prime_state_context() {
+  [[ -n "${RMCP_INSTALL_STATE:-}" && -f "$RMCP_INSTALL_STATE" ]] || return 0
+  # Installer-owned metadata supplied by the installed rmcp launcher.
+  # shellcheck disable=SC1090
+  source "$RMCP_INSTALL_STATE"
+}
+
+on_exit() {
+  local rc=$?
+  trap - EXIT
+  if (( rc != 0 )) && [[ "$INSTALL_TRACKING" == true && "$INSTALL_COMPLETE" != true ]]; then
+    set +e
+    write_progress_state INCOMPLETE "$LAST_COMPLETED_STAGE" "$LAST_ERROR_CLASS"
+    write_install_state INCOMPLETE
+    if [[ "$PROMOTED" == true && "$LOCAL_VALIDATED" != true && -n "${PREVIOUS_CURRENT:-}" ]]; then
+      rollback_promoted_release
+      if [[ "$SERVICE_BACKEND" == systemd ]] && command -v systemctl >/dev/null 2>&1; then systemctl restart remote-host-mcp.service >/dev/null 2>&1 || true; fi
+    fi
+    warn "Installation is INCOMPLETE at stage ${LAST_COMPLETED_STAGE}. Resume with: rmcp resume (or rerun installer --resume)."
+  fi
+  exit "$rc"
+}
+trap on_exit EXIT
+
+stage_rank() {
+  case "$1" in
+    NONE) printf '0\n' ;;
+    PRECHECK) printf '10\n' ;;
+    PREPARE) printf '20\n' ;;
+    RELEASE) printf '30\n' ;;
+    RUNTIME) printf '40\n' ;;
+    CLI_RECOVERY) printf '50\n' ;;
+    SERVICE) printf '60\n' ;;
+    LOCAL_READY) printf '70\n' ;;
+    INGRESS) printf '80\n' ;;
+    TLS) printf '90\n' ;;
+    PUBLIC_READY) printf '100\n' ;;
+    MCP_VERIFY) printf '110\n' ;;
+    COMPLETE) printf '120\n' ;;
+    *) printf '0\n' ;;
+  esac
+}
+
+resume_has_stage() {
+  local target="$1"
+  [[ "$RESUME_MODE" == true ]] || return 1
+  (( $(stage_rank "$RESUME_FROM_STAGE") >= $(stage_rank "$target") ))
+}
+
+stage_done() {
+  LAST_COMPLETED_STAGE="$1"
+  write_progress_state INCOMPLETE "$LAST_COMPLETED_STAGE" ''
+}
 
 select_language() {
   if [[ -n "${RHMCP_LANGUAGE:-}" ]]; then load_locale "$RHMCP_LANGUAGE"; return; fi
@@ -45,8 +138,31 @@ preflight() {
   ok "Python $(python3 --version 2>&1 | awk '{print $2}')"
   command_exists curl && ok 'curl' || die 'curl is required / 需要 curl'
   command_exists tar && ok 'tar' || die 'tar is required / 需要 tar'
-  if command_exists systemctl && [[ -d /run/systemd/system ]]; then ok 'systemd'; else warn 'systemd unavailable; portable service backend will be used'; fi
+  command_exists openssl && ok 'openssl' || die 'openssl is required / 需要 openssl'
+  python_venv_preflight || die 'Python venv/ensurepip is required. / 需要 Python venv/ensurepip。'
+  ok 'Python venv + ensurepip'
+  command_exists ssh && ok 'OpenSSH client' || warn 'ssh client not found; ssh_* tools will fail closed until OpenSSH is installed'
+  command_exists scp && ok 'SCP client' || warn 'scp client not found; ssh_upload/ssh_download will fail closed until OpenSSH is installed'
+  if systemd_operational; then ok 'systemd manager'; else warn 'operational systemd manager unavailable; portable backend will be used where supported'; fi
   [[ -d /mnt/workspace ]] && ok '/mnt/workspace detected' || true
+}
+
+preflight_layout() {
+  require_disk_space_mb "$CODE_BASE" "${RHMCP_BASE_MIN_FREE_MB:-256}" || die 'Insufficient free disk space for staged install (minimum 256 MiB base workspace by default).'
+  ok 'Base disk space preflight'
+}
+
+preflight_profile_resources() {
+  local default_required required
+  case "$INGRESS" in
+    private) default_required=256 ;;
+    cloudflare-tunnel) default_required=384 ;;
+    domain|public-ip) default_required=512 ;;
+    *) default_required=512 ;;
+  esac
+  required="${RHMCP_MIN_FREE_MB:-$default_required}"
+  require_disk_space_mb "$CODE_BASE" "$required" || die "Insufficient free disk space for ingress profile ${INGRESS} (minimum ${required} MiB)."
+  ok "Ingress resource preflight: ${required} MiB free-space floor"
 }
 
 choose_authority() {
@@ -76,7 +192,7 @@ choose_authority() {
 choose_auth() {
   header "$(t auth)"
   printf '  1. %s\n  2. %s\n' "$(t auth_capability)" "$(t auth_oauth)"
-  local choice default_audience url
+  local choice default_audience url scheme_host
   read -r -p 'Select / 选择 [1-2]: ' choice
   case "$choice" in
     1)
@@ -92,29 +208,92 @@ PY
       PATH_KEY=''
       read -r -p 'OAuth issuer (https://...) / OAuth Issuer: ' OAUTH_ISSUER
       read -r -p 'JWKS URL (https://...) / JWKS 地址: ' OAUTH_JWKS_URL
-      default_audience="https://${PUBLIC_HOST}/mcp"
+      if [[ "$INGRESS" == private ]]; then
+        scheme_host="http://127.0.0.1:${LOCAL_PORT}"
+      elif [[ "$PUBLIC_HTTPS_PORT" == 443 ]]; then
+        scheme_host="https://${PUBLIC_HOST}"
+      else
+        scheme_host="https://${PUBLIC_HOST}:${PUBLIC_HTTPS_PORT}"
+      fi
+      default_audience="${scheme_host}/mcp"
       read -r -p "OAuth audience [${default_audience}]: " OAUTH_AUDIENCE
       OAUTH_AUDIENCE="${OAUTH_AUDIENCE:-$default_audience}"
       read -r -p 'OAuth scopes [remote-host]: ' OAUTH_SCOPES
       OAUTH_SCOPES="${OAUTH_SCOPES:-remote-host}"
-      for url in "$OAUTH_ISSUER" "$OAUTH_JWKS_URL" "$OAUTH_AUDIENCE"; do
-        [[ "$url" == https://* ]] || die 'OAuth URLs must use https:// / OAuth URL 必须使用 https://'
-      done
+      for url in "$OAUTH_ISSUER" "$OAUTH_JWKS_URL"; do [[ "$url" == https://* ]] || die 'OAuth issuer/JWKS URLs must use https://'; done
       ;;
     *) die 'Invalid selection / 无效选项' ;;
   esac
 }
 
+read_https_ports() {
+  local input
+  read -r -p 'Public HTTPS port [443]: ' input
+  PUBLIC_HTTPS_PORT="${input:-443}"
+  [[ "$PUBLIC_HTTPS_PORT" =~ ^[0-9]+$ && "$PUBLIC_HTTPS_PORT" -ge 1 && "$PUBLIC_HTTPS_PORT" -le 65535 ]] || die 'Invalid public HTTPS port.'
+  read -r -p "Local HTTPS listen port [${PUBLIC_HTTPS_PORT}] (Enter=same; change only for provider/NAT mapping): " input
+  HTTPS_LISTEN_PORT="${input:-$PUBLIC_HTTPS_PORT}"
+  [[ "$HTTPS_LISTEN_PORT" =~ ^[0-9]+$ && "$HTTPS_LISTEN_PORT" -ge 1 && "$HTTPS_LISTEN_PORT" -le 65535 ]] || die 'Invalid local HTTPS listen port.'
+}
+
 choose_ingress() {
   header "$(t ingress)"
-  printf '  1. %s\n  2. %s\n' "$(t ingress_direct)" "$(t ingress_tunnel)"
-  local choice host
-  read -r -p 'Select / 选择 [1-2]: ' choice
-  case "$choice" in 1) INGRESS=direct ;; 2) INGRESS=cloudflare-tunnel ;; *) die 'Invalid selection / 无效选项' ;; esac
-  read -r -p "$(t domain_prompt): " host
-  host="${host,,}"; host="${host%.}"
-  valid_hostname "$host" || die 'Invalid hostname / 域名格式无效'
-  PUBLIC_HOST="$host"
+  printf '  1. Public IP HTTPS\n  2. Domain HTTPS\n  3. Cloudflare Tunnel\n  4. Private/local only\n'
+  local choice host mode challenge
+  read -r -p 'Select / 选择 [1-4]: ' choice
+  case "$choice" in
+    1)
+      INGRESS=public-ip
+      read -r -p 'Public IPv4 address: ' host
+      valid_ipv4 "$host" || die 'Invalid public IPv4 address.'
+      PUBLIC_HOST="$host"
+      read_https_ports
+      read -r -p 'ACME contact email: ' ACME_EMAIL
+      [[ "$ACME_EMAIL" == *@*.* ]] || die 'Valid ACME contact email is required.'
+      ;;
+    2)
+      INGRESS=domain
+      read -r -p "$(t domain_prompt): " host
+      host="${host,,}"; host="${host%.}"
+      valid_hostname "$host" || die 'Invalid hostname / 域名格式无效'
+      PUBLIC_HOST="$host"
+      read_https_ports
+      printf '  1. Cloudflare DNS only\n  2. Cloudflare Proxied (Full strict)\n  3. Other DNS provider / plain DNS\n'
+      read -r -p 'DNS mode [1-3]: ' mode
+      case "$mode" in
+        1)
+          DOMAIN_DNS_MODE=cloudflare-dns-only
+          printf '  1. Auto: HTTP-01 first, DNS-01 fallback\n  2. DNS-01 only (no public port 80 required)\n'
+          read -r -p 'Certificate challenge [1-2, default 1]: ' challenge
+          case "${challenge:-1}" in 1) DOMAIN_CHALLENGE_MODE=auto ;; 2) DOMAIN_CHALLENGE_MODE=dns-01 ;; *) die 'Invalid certificate challenge mode.' ;; esac
+          ;;
+        2)
+          DOMAIN_DNS_MODE=cloudflare-proxied
+          DOMAIN_CHALLENGE_MODE=dns-01
+          info 'Cloudflare Proxied mode uses DNS-01; public port 80 is not required for certificate validation.'
+          ;;
+        3)
+          DOMAIN_DNS_MODE=other
+          DOMAIN_CHALLENGE_MODE=auto
+          ;;
+        *) die 'Invalid DNS mode.' ;;
+      esac
+      read -r -p 'ACME contact email: ' ACME_EMAIL
+      [[ "$ACME_EMAIL" == *@*.* ]] || die 'Valid ACME contact email is required.'
+      ;;
+    3)
+      INGRESS=cloudflare-tunnel
+      read -r -p "$(t domain_prompt): " host
+      host="${host,,}"; host="${host%.}"
+      valid_hostname "$host" || die 'Invalid hostname / 域名格式无效'
+      PUBLIC_HOST="$host"; PUBLIC_HTTPS_PORT=443; HTTPS_LISTEN_PORT=443
+      ;;
+    4)
+      INGRESS=private
+      PUBLIC_HOST=mcp.invalid; PUBLIC_HTTPS_PORT=443; HTTPS_LISTEN_PORT=443
+      ;;
+    *) die 'Invalid selection / 无效选项' ;;
+  esac
 }
 
 write_env() {
@@ -140,6 +319,14 @@ RHMCP_MAX_TIMEOUT_MS=90000
 RHMCP_JSON_RESPONSE=true
 RHMCP_STATELESS_HTTP=true
 RHMCP_TASKS_EXTENSION=true
+RHMCP_BUILD_COMMIT=${RESOLVED_COMMIT}
+RHMCP_BUILD_REF=${REQUESTED_REF}
+RHMCP_INGRESS_PROFILE=${INGRESS}
+RHMCP_PUBLIC_HTTPS_PORT=${PUBLIC_HTTPS_PORT}
+RHMCP_HTTPS_LISTEN_PORT=${HTTPS_LISTEN_PORT}
+RHMCP_DOMAIN_DNS_MODE=${DOMAIN_DNS_MODE}
+RHMCP_DOMAIN_CHALLENGE_MODE=${DOMAIN_CHALLENGE_MODE}
+RHMCP_ACME_EMAIL=${ACME_EMAIL}
 EOF2
   if [[ "$AUTH_MODE" == oauth ]]; then
     cat >> "$env_file" <<EOF2
@@ -153,146 +340,328 @@ EOF2
   chmod 600 "$env_file"
 }
 
+load_resume_env() {
+  local env_file="$CONFIG_DIR/rhmcp.env"
+  [[ -f "$env_file" ]] || die 'Resume requires existing rhmcp.env; secrets will not be reconstructed.'
+  set -a
+  # shellcheck disable=SC1090
+  source "$env_file"
+  set +a
+  AUTH_MODE="${RHMCP_AUTH_MODE:-$AUTH_MODE}"
+  PATH_KEY="${RHMCP_PATH_KEY:-}"
+  PUBLIC_HOST="${RHMCP_PUBLIC_HOST:-$PUBLIC_HOST}"
+  LOCAL_PORT="${RHMCP_PORT:-$LOCAL_PORT}"
+  DOMAIN_DNS_MODE="${RHMCP_DOMAIN_DNS_MODE:-$DOMAIN_DNS_MODE}"
+  DOMAIN_CHALLENGE_MODE="${RHMCP_DOMAIN_CHALLENGE_MODE:-$DOMAIN_CHALLENGE_MODE}"
+  PUBLIC_HTTPS_PORT="${RHMCP_PUBLIC_HTTPS_PORT:-$PUBLIC_HTTPS_PORT}"
+  HTTPS_LISTEN_PORT="${RHMCP_HTTPS_LISTEN_PORT:-$PUBLIC_HTTPS_PORT}"
+  ACME_EMAIL="${RHMCP_ACME_EMAIL:-$ACME_EMAIL}"
+  OAUTH_ISSUER="${RHMCP_OAUTH_ISSUER:-}"
+  OAUTH_JWKS_URL="${RHMCP_OAUTH_JWKS_URL:-}"
+  OAUTH_AUDIENCE="${RHMCP_OAUTH_AUDIENCE:-}"
+  OAUTH_SCOPES="${RHMCP_OAUTH_SCOPES:-remote-host}"
+}
+
 copy_release() {
-  local short release
-  short="$(git -C "$SOURCE_ROOT" rev-parse --short HEAD 2>/dev/null || printf 'source')"
-  release="$RELEASES_DIR/${RMCP_VERSION}-${short}"
-  [[ ! -e "$release" ]] || release="$RELEASES_DIR/${RMCP_VERSION}-${short}-$(date +%Y%m%d%H%M%S)"
-  mkdir -p "$release"
-  (cd "$SOURCE_ROOT" && tar --exclude='.git' --exclude='.venv' --exclude='logs' --exclude='secrets' --exclude='backups' --exclude='.runtime' -cf - .) | (cd "$release" && tar -xf -)
+  local release="$RELEASES_DIR/$RELEASE_ID" staging meta_commit
+  if [[ -d "$release" ]]; then
+    [[ -f "$release/.rhmcp-release.env" ]] || die "Existing release lacks provenance metadata: $release"
+    meta_commit="$(awk -F= '$1=="RHMCP_BUILD_COMMIT" {print $2; exit}' "$release/.rhmcp-release.env")"
+    [[ "$meta_commit" == "$RESOLVED_COMMIT" ]] || die 'Existing release ID belongs to a different commit.'
+    RELEASE_DIR="$release"; export RELEASE_DIR
+    return 0
+  fi
+  staging="${release}.staging.$$"
+  rm -rf -- "$staging"
+  mkdir -p "$staging"
+  (cd "$SOURCE_ROOT" && tar --exclude='.git' --exclude='.venv' --exclude='logs' --exclude='secrets' --exclude='backups' --exclude='.runtime' -cf - .) | (cd "$staging" && tar -xf -)
+  write_release_metadata "$staging"
+  mv "$staging" "$release"
   ln -sfn "$CONFIG_DIR/rhmcp.env" "$release/.env"
   ln -sfn "$LOG_DIR" "$release/logs"
   ln -sfn "$SECRET_DIR" "$release/secrets"
   ln -sfn "$BACKUP_DIR" "$release/backups"
   ln -sfn "$RUNTIME_DIR" "$release/.runtime"
-  ln -sfn "$release" "$CURRENT_LINK"
   RELEASE_DIR="$release"; export RELEASE_DIR
+  record_resource release "$release" created
 }
 
 install_runtime() {
+  if [[ -x "$RELEASE_DIR/.venv/bin/remote-host-mcp" ]]; then ok 'Existing staged runtime is complete; reusing it.'; return 0; fi
+  rm -rf -- "$RELEASE_DIR/.venv"
   info 'Creating Python virtual environment / 创建 Python 虚拟环境'
   python3 -m venv "$RELEASE_DIR/.venv"
-  "$RELEASE_DIR/.venv/bin/python" -m pip install -q --upgrade pip
-  "$RELEASE_DIR/.venv/bin/pip" install -q "$RELEASE_DIR"
+  "$RELEASE_DIR/.venv/bin/python" -m pip install -q --no-cache-dir --upgrade pip
+  "$RELEASE_DIR/.venv/bin/pip" install -q --no-cache-dir "$RELEASE_DIR"
+  [[ -x "$RELEASE_DIR/.venv/bin/remote-host-mcp" ]] || die 'Runtime install did not create remote-host-mcp entrypoint.'
 }
 
-install_systemd_service() {
-  [[ "$INSTALL_MODE" == system && $EUID -eq 0 && -d /run/systemd/system ]] || return 1
-  cat > /etc/systemd/system/remote-host-mcp.service <<EOF2
-[Unit]
-Description=Remote Host MCP
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=${SERVICE_USER}
-EnvironmentFile=${CONFIG_DIR}/rhmcp.env
-WorkingDirectory=${CURRENT_LINK}
-ExecStart=${CURRENT_LINK}/.venv/bin/remote-host-mcp
-Restart=on-failure
-RestartSec=2
-NoNewPrivileges=false
-
-[Install]
-WantedBy=multi-user.target
-EOF2
-  if [[ "$AUTHORITY" == user ]]; then chown -R "$SERVICE_USER":"$(id -gn "$SERVICE_USER")" "$STATE_DIR" "$LOG_DIR" "$RUNTIME_DIR"; fi
-  systemctl daemon-reload
-  systemctl enable --now remote-host-mcp.service
-  SERVICE_BACKEND=systemd
+start_service() {
+  local rc
+  set +e; install_managed_systemd_service; rc=$?; set -e
+  case "$rc" in
+    0) ;;
+    1) start_portable_service_managed ;;
+    *) die 'System service path is occupied by a foreign resource; refusing portable fallback that would hide the conflict.' ;;
+  esac
 }
 
-start_portable_service() { (cd "$CURRENT_LINK" && bash scripts/manage.sh restart >/dev/null); SERVICE_BACKEND=portable; }
-local_health() { curl -fsS --max-time 8 "http://127.0.0.1:${LOCAL_PORT}/health" >/dev/null; }
-
-configure_tunnel() {
-  local input token token_file cf
-  printf '\n%s\n' "$(t tunnel_paste)"
-  read -r -p '> ' input
-  token="$(extract_cloudflare_token "$input")" || die 'Could not parse a valid Tunnel Token. / 未识别到有效 Tunnel Token。'
-  token_file="$(save_cloudflare_token "$token" "$SECRET_DIR")"; unset token input
-  ok "Tunnel Token saved / Tunnel Token 已安全保存: $token_file"
-  warn "Cloudflare Published Application must route ${PUBLIC_HOST} to http://127.0.0.1:${LOCAL_PORT}"
-  if [[ "$SERVICE_BACKEND" == systemd ]]; then
-    cf="$(ensure_cloudflared_binary "$RUNTIME_DIR")"
-    cat > /etc/systemd/system/remote-host-mcp-tunnel.service <<EOF2
-[Unit]
-Description=Remote Host MCP Cloudflare Tunnel
-After=network-online.target remote-host-mcp.service
-Wants=network-online.target
-Requires=remote-host-mcp.service
-
-[Service]
-Type=simple
-ExecStart=${cf} tunnel --no-autoupdate run --token-file ${token_file}
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF2
-    systemctl daemon-reload; systemctl enable --now remote-host-mcp-tunnel.service
+configure_cloudflare_dns_secret() {
+  local token token_file zone
+  token_file="$(cloudflare_dns_token_file)"
+  if [[ -r "$token_file" ]]; then return 0; fi
+  if [[ -n "${RHMCP_CF_DNS_TOKEN_SOURCE:-}" && -r "$RHMCP_CF_DNS_TOKEN_SOURCE" ]]; then
+    token="$(tr -d '\r\n' < "$RHMCP_CF_DNS_TOKEN_SOURCE")"
   else
-    CFD_HOST="$PUBLIC_HOST" bash "$CURRENT_LINK/scripts/setup-cft.sh" --reuse-token || true
+    printf 'Cloudflare DNS API token (Zone DNS Edit + Zone Read, target zone only): '
+    read -r -s token; printf '\n'
   fi
-  for _ in {1..12}; do
-    if curl -fsS --max-time 8 "https://${PUBLIC_HOST}/health" >/dev/null 2>&1; then PUBLIC_READY=true; break; fi
-    sleep 2
-  done
-  [[ "$PUBLIC_READY" == true ]] || warn 'Tunnel is configured but public health is not ready yet. / Tunnel 已配置，但公网健康检查尚未通过。'
+  save_cloudflare_dns_token "$token" >/dev/null || { unset token; die 'Invalid Cloudflare DNS token format.'; }
+  unset token
+  zone="$(_cf_zone_for_name "$PUBLIC_HOST" 2>/dev/null || true)"
+  if [[ -z "$zone" ]]; then rm -f "$token_file"; die 'Cloudflare token cannot read the target zone; token removed.'; fi
+  ok "Cloudflare DNS token configured at $token_file (secret value not logged)"
 }
 
-configure_direct() {
-  prepare_direct_ingress "$PUBLIC_HOST" "$LOCAL_PORT"
-  if curl -fsS --max-time 8 "https://${PUBLIC_HOST}/health" >/dev/null 2>&1; then PUBLIC_READY=true
-  elif [[ "$DIRECT_READY" != true ]]; then warn 'Direct HTTPS requires the generated reverse-proxy/TLS configuration to be activated before ChatGPT can connect.'; fi
+configure_ingress() {
+  local input token_file rc
+  case "$INGRESS" in
+    private)
+      PUBLIC_READY=true
+      info 'Private/local profile: no public port is exposed by the installer.'
+      ;;
+    cloudflare-tunnel)
+      token_file="$SECRET_DIR/cloudflared.token"
+      if [[ -r "$token_file" ]]; then
+        install_managed_tunnel_service "$token_file"
+        set +e; external_http_probe "https://${PUBLIC_HOST}/health" 200; rc=$?; set -e
+        [[ $rc -eq 0 ]] || die 'Existing Tunnel credential is present but external HTTPS validation failed.'
+        PUBLIC_READY=true
+      else
+        printf '\n%s\n' "$(t tunnel_paste)"
+        read -r -p '> ' input
+        configure_managed_cloudflare_tunnel "$PUBLIC_HOST" "$input"
+        unset input
+      fi
+      ;;
+    domain)
+      [[ $EUID -eq 0 ]] || die 'Managed Domain HTTPS requires root/sudo.'
+      if [[ "$DOMAIN_DNS_MODE" == cloudflare-proxied ]]; then configure_cloudflare_dns_secret; fi
+      configure_domain_https "$PUBLIC_HOST" "$ACME_EMAIL" "$DOMAIN_DNS_MODE" "$HTTPS_LISTEN_PORT" "$PUBLIC_HTTPS_PORT" "$DOMAIN_CHALLENGE_MODE"
+      PUBLIC_READY=true
+      ;;
+    public-ip)
+      [[ $EUID -eq 0 ]] || die 'Managed Public IP HTTPS requires root/sudo.'
+      configure_public_ip_https "$PUBLIC_HOST" "$ACME_EMAIL" "$HTTPS_LISTEN_PORT" "$PUBLIC_HTTPS_PORT"
+      PUBLIC_READY=true
+      ;;
+    *) die "Unknown ingress profile: $INGRESS" ;;
+  esac
 }
 
-register_rmcp() {
-  local wrapper target
-  target="$CURRENT_LINK/scripts/rmcp.sh"
-  if [[ $EUID -eq 0 && -d /usr/local/bin ]]; then wrapper=/usr/local/bin/rmcp; else mkdir -p "${HOME}/.local/bin"; wrapper="${HOME}/.local/bin/rmcp"; fi
-  cat > "$wrapper" <<EOF2
-#!/usr/bin/env bash
-export RMCP_INSTALL_STATE='${INSTALL_STATE}'
-exec bash '${target}' "\$@"
-EOF2
-  chmod 755 "$wrapper"
-  ok "rmcp -> $wrapper"
+public_health_reusable() {
+  local url rc
+  [[ "$INGRESS" != private ]] || return 0
+  if [[ "$PUBLIC_HTTPS_PORT" == 443 ]]; then url="https://${PUBLIC_HOST}/health"; else url="https://${PUBLIC_HOST}:${PUBLIC_HTTPS_PORT}/health"; fi
+  set +e; external_http_probe "$url" 200; rc=$?; set -e
+  [[ $rc -eq 0 ]]
+}
+
+mcp_final_validation() {
+  local base url bearer="${RHMCP_VALIDATION_BEARER_TOKEN:-}"
+  if [[ "$INGRESS" == private ]]; then
+    base="http://127.0.0.1:${LOCAL_PORT}"
+  elif [[ "$PUBLIC_HTTPS_PORT" == 443 ]]; then
+    base="https://${PUBLIC_HOST}"
+  else
+    base="https://${PUBLIC_HOST}:${PUBLIC_HTTPS_PORT}"
+  fi
+  if [[ "$AUTH_MODE" == capability ]]; then
+    [[ -n "$PATH_KEY" ]] || die 'Capability path key is missing.'
+    url="${base}/mcp/${PATH_KEY}"
+  else
+    url="${base}/mcp"
+    if [[ -z "$bearer" ]]; then
+      printf 'OAuth validation bearer token (used once; not stored): '
+      read -r -s bearer; printf '\n'
+    fi
+    [[ -n "$bearer" ]] || die 'OAuth final MCP validation requires a one-time bearer token.'
+  fi
+  RHMCP_VALIDATE_URL="$url" RHMCP_VALIDATION_BEARER_TOKEN="$bearer" RHMCP_VALIDATE_TOOL_COUNT=65 \
+    "$CURRENT_LINK/.venv/bin/python" "$CURRENT_LINK/installer/validate_mcp.py"
+  unset bearer url
 }
 
 show_result() {
   header "$(t done)"
-  printf 'Version / 版本        : %s\nInstall root / 路径   : %s\nAuthority / 权限      : %s\nIngress / 接入        : %s\nLocal endpoint / 本地 : http://127.0.0.1:%s\nPublic host / 域名    : %s\n' "$RMCP_VERSION" "$CODE_BASE" "$AUTHORITY" "$INGRESS" "$LOCAL_PORT" "$PUBLIC_HOST"
-  if [[ "$PUBLIC_READY" == true ]]; then
-    if [[ "$AUTH_MODE" == capability ]]; then
-      subhr; printf '%s:\n\nhttps://%s/mcp/%s\n\n' "$(t copy_url)" "$PUBLIC_HOST" "$PATH_KEY"; warn "$(t secret_warn)"
-    else printf 'MCP URL               : https://%s/mcp\n' "$PUBLIC_HOST"; fi
-  else
-    warn 'Public endpoint is not verified yet; the secret URL is intentionally not printed. / 公网入口尚未验证，暂不显示完整私密 URL。'
+  printf 'Version / 版本        : %s\nBuild commit / 提交   : %s\nBuild ref / 引用      : %s\nInstall root / 路径   : %s\nAuthority / 权限      : %s\nIngress / 接入        : %s\nLocal endpoint / 本地 : http://127.0.0.1:%s\n' "$RMCP_VERSION" "$RESOLVED_COMMIT" "$REQUESTED_REF" "$CODE_BASE" "$AUTHORITY" "$INGRESS" "$LOCAL_PORT"
+  if [[ "$INGRESS" != private ]]; then
+    printf 'Public endpoint / 公网 : https://%s%s\n' "$PUBLIC_HOST" "$([[ "$PUBLIC_HTTPS_PORT" == 443 ]] && printf '' || printf ':%s' "$PUBLIC_HTTPS_PORT")"
+    if [[ "$INGRESS" == domain || "$INGRESS" == public-ip ]]; then printf 'HTTPS listen / 本机   : %s\n' "$HTTPS_LISTEN_PORT"; fi
   fi
-  hr; printf 'Management / 管理: rmcp\n'
+  if [[ "$AUTH_MODE" == capability ]]; then
+    subhr
+    if [[ "$INGRESS" == private ]]; then
+      printf '%s:\n\nhttp://127.0.0.1:%s/mcp/%s\n\n' "$(t copy_url)" "$LOCAL_PORT" "$PATH_KEY"
+    else
+      printf '%s:\n\nhttps://%s%s/mcp/%s\n\n' "$(t copy_url)" "$PUBLIC_HOST" "$([[ "$PUBLIC_HTTPS_PORT" == 443 ]] && printf '' || printf ':%s' "$PUBLIC_HTTPS_PORT")" "$PATH_KEY"
+    fi
+    warn "$(t secret_warn)"
+  else
+    printf 'Authentication / 认证 : OAuth 2.1\n'
+  fi
+  hr; printf 'Management / 管理: rmcp status | rmcp doctor | rmcp configure | rmcp uninstall --dry-run\n'
+}
+
+handle_existing_transaction() {
+  local source_commit choice
+  source_commit="$RESOLVED_COMMIT"
+  if [[ -f "$INSTALL_STATE" ]]; then
+    load_install_state "$INSTALL_STATE" || true
+    if [[ "${RHMCP_INSTALL_STATUS:-}" == COMPLETE && "$ACTION" == install ]]; then
+      die 'A complete installation already exists. Use rmcp status/doctor/repair/configure or uninstall before reinstalling.'
+    fi
+  fi
+  if [[ ! -f "$PROGRESS_STATE" ]]; then
+    [[ "$ACTION" != resume ]] || die 'No incomplete transaction exists to resume.'
+    return 0
+  fi
+  load_progress_state || return 0
+  [[ "${INSTALL_STATUS:-}" == INCOMPLETE ]] || return 0
+  if [[ "$ACTION" == install ]]; then
+    warn "Found incomplete install at stage ${LAST_COMPLETED_STAGE:-unknown}."
+    printf '  1. Resume\n  2. Diagnose\n  3. Ownership-aware purge of incomplete install\n  0. Exit\n'
+    read -r -p 'Select [0-3]: ' choice
+    case "$choice" in 1) ACTION=resume ;; 2) ACTION=diagnose ;; 3) ACTION=uninstall-incomplete ;; *) exit 0 ;; esac
+  fi
+  case "$ACTION" in
+    resume)
+      [[ "${TARGET_COMMIT:-}" == "$source_commit" ]] || die "Resume requires original commit ${TARGET_COMMIT:-unknown}; current source is $source_commit."
+      RESUME_FROM_STAGE="${LAST_COMPLETED_STAGE:-NONE}"
+      restore_transaction_state || die 'Incomplete transaction metadata is not resumable.'
+      RESUME_MODE=true
+      load_resume_env
+      ;;
+    diagnose)
+      if [[ -f "$INSTALL_STATE" ]]; then load_install_layout_from_state "$INSTALL_STATE"; fi
+      diagnose_install
+      exit 0
+      ;;
+    uninstall-incomplete)
+      restore_transaction_state || true
+      LOCAL_PORT="${TARGET_LOCAL_PORT:-$LOCAL_PORT}"
+      if resource_owned certificate && [[ "${RHMCP_PURGE_CERTIFICATES:-0}" != 1 ]]; then
+        warn 'Incomplete install owns an ACME certificate. Review the purge plan before confirming removal.'
+      fi
+      uninstall_plan true
+      confirm 'Apply purge of product-owned incomplete resources?' || exit 0
+      RHMCP_PURGE_CERTIFICATES=1 uninstall_apply true
+      stray_check true
+      exit 0
+      ;;
+  esac
+}
+
+run_repair_or_diagnose_from_state() {
+  [[ -n "${RMCP_INSTALL_STATE:-}" && -f "$RMCP_INSTALL_STATE" ]] || return 1
+  load_install_layout_from_state "$RMCP_INSTALL_STATE"
+  load_locale "${RHMCP_LANGUAGE:-en_US}"
+  LOCAL_PORT="${RHMCP_LOCAL_PORT:-$LOCAL_PORT}"
+  case "$ACTION" in repair) repair_local_lifecycle ;; diagnose) diagnose_install ;; *) return 1 ;; esac
+  exit 0
+}
+
+prepare_action_layout() {
+  if [[ "$ACTION" == resume && -n "${RMCP_INSTALL_STATE:-}" && -f "$RMCP_INSTALL_STATE" ]]; then
+    load_install_layout_from_state "$RMCP_INSTALL_STATE" || die 'Install state contains an unsafe or invalid layout.'
+  else
+    choose_layout
+  fi
+  preflight_layout
+  resolve_build_provenance
+  handle_existing_transaction
 }
 
 main() {
+  parse_args "$@"
+  prime_state_context
+  if [[ "$ACTION" == repair || "$ACTION" == diagnose ]]; then run_repair_or_diagnose_from_state || true; fi
   select_language
   header "$(t title) $RMCP_VERSION"
   preflight
-  choose_layout
-  choose_authority
-  choose_port 8765; LOCAL_PORT="$CHOSEN_PORT"
-  choose_ingress
-  choose_auth
+  prepare_action_layout
+
+  if [[ "$ACTION" == repair || "$ACTION" == diagnose ]]; then
+    [[ -f "$INSTALL_STATE" ]] || die 'No install-state found for repair/diagnose.'
+    load_install_layout_from_state "$INSTALL_STATE"
+    if [[ "$ACTION" == repair ]]; then repair_local_lifecycle; else diagnose_install; fi
+    return 0
+  fi
+
+  if [[ "$RESUME_MODE" != true ]]; then
+    choose_authority
+    choose_port 8765; LOCAL_PORT="$CHOSEN_PORT"
+    choose_ingress
+    preflight_profile_resources
+    choose_auth
+  fi
+
   prepare_layout_dirs
-  write_env
+  INSTALL_TRACKING=true
+  if [[ "$RESUME_MODE" != true ]]; then
+    write_progress_state INCOMPLETE PRECHECK ''
+    write_install_state INCOMPLETE
+    LAST_COMPLETED_STAGE=PRECHECK
+    write_env
+    stage_done PREPARE
+  else
+    LAST_COMPLETED_STAGE="$RESUME_FROM_STAGE"
+    info "Resuming fixed commit ${RESOLVED_COMMIT} from completed stage ${RESUME_FROM_STAGE}."
+  fi
+
   copy_release
+  if ! resume_has_stage RELEASE; then stage_done RELEASE; fi
   install_runtime
-  if ! install_systemd_service; then start_portable_service; fi
-  local_health || die 'Local health check failed / 本地健康检查失败'
-  case "$INGRESS" in cloudflare-tunnel) configure_tunnel ;; direct) configure_direct ;; esac
-  write_install_state
-  register_rmcp
+  if ! resume_has_stage RUNTIME; then stage_done RUNTIME; fi
+
+  promote_release; PROMOTED=true
+  write_install_state INCOMPLETE
+  install_rmcp_launcher
+  if ! resume_has_stage CLI_RECOVERY; then stage_done CLI_RECOVERY; fi
+
+  if resume_has_stage SERVICE && wait_local_health "$LOCAL_PORT" 2 1; then
+    info 'Existing managed service is already healthy; reusing it.'
+  else
+    start_service
+    stage_done SERVICE
+  fi
+
+  if ! wait_local_health "$LOCAL_PORT" "${RHMCP_READINESS_TIMEOUT_S:-30}" 1; then
+    LAST_ERROR_CLASS=READINESS_TIMEOUT
+    service_readiness_diagnostics "$LOCAL_PORT"
+    return 1
+  fi
+  LOCAL_VALIDATED=true
+  if ! resume_has_stage LOCAL_READY; then stage_done LOCAL_READY; fi
+
+  if resume_has_stage PUBLIC_READY && public_health_reusable; then
+    PUBLIC_READY=true
+    info 'Existing public/TLS layer revalidated; skipping duplicate ingress/certificate creation.'
+  else
+    configure_ingress
+    stage_done INGRESS
+    stage_done TLS
+    [[ "$PUBLIC_READY" == true ]] || { LAST_ERROR_CLASS=PUBLIC_NOT_READY; return 1; }
+    stage_done PUBLIC_READY
+  fi
+
+  mcp_final_validation
+  stage_done MCP_VERIFY
+
+  write_install_state COMPLETE
+  write_progress_state COMPLETE COMPLETE ''
+  LAST_COMPLETED_STAGE=COMPLETE
+  INSTALL_COMPLETE=true
   show_result
 }
 

@@ -16,12 +16,13 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from . import __version__
+from .provenance import get_build_provenance
 
 PRODUCT_NAME = "Remote Host MCP"
 PRODUCT_TITLE = "Remote Host MCP"
 PRODUCT_DESCRIPTION = (
     "General-purpose MCP control plane for remote Linux hosts and containers, "
-    "with shell, PTY, filesystem, transfer, durable jobs, process and service tools."
+    "with shell, PTY, filesystem, transfer, artifacts, SSH, durable jobs, process and service tools."
 )
 
 # Ordered from specific legacy product phrases to the final generic fallback.
@@ -69,11 +70,14 @@ def _rewrite_schema(value: Any) -> Any:
 
 
 async def _health(_request: Request) -> Response:
+    build_commit, build_ref = get_build_provenance()
     return JSONResponse(
         {
             "ok": True,
             "service": PRODUCT_NAME,
             "version": __version__,
+            "build_commit": build_commit,
+            "build_ref": build_ref,
             "transport": "streamable-http",
         },
         headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
@@ -100,7 +104,10 @@ def apply_generic_branding(mcp: MCPServer) -> MCPServer:
     for tool in manager.list_tools():
         tool.title = _generic_text(tool.title)
         tool.description = _generic_text(tool.description) or ""
-        tool.parameters = _rewrite_schema(tool.parameters)
+        parameters = _rewrite_schema(tool.parameters)
+        if isinstance(parameters, dict) and parameters.get("type") == "object":
+            parameters["additionalProperties"] = False
+        tool.parameters = parameters
 
     # status() returns a typed StatusResult whose service field was historically
     # DSW-specific. Reuse the proven implementation and only replace the label.

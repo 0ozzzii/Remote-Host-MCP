@@ -176,6 +176,7 @@ diagnose_install() {
   printf 'Ingress            : %s\n' "${RHMCP_INGRESS:-${INGRESS:-unknown}}"
   printf 'Local endpoint     : http://127.0.0.1:%s\n' "${RHMCP_LOCAL_PORT:-${LOCAL_PORT:-8765}}"
   printf 'Current release    : %s\n' "$(readlink -f "${CURRENT_LINK:-/nonexistent}" 2>/dev/null || printf 'missing')"
+  if declare -F private_python_diagnose >/dev/null 2>&1; then private_python_diagnose; fi
   if [[ -f "${PROGRESS_STATE:-}" ]]; then
     # shellcheck disable=SC1090
     source "$PROGRESS_STATE"
@@ -269,6 +270,9 @@ repair_local_lifecycle() {
   [[ -d "$CURRENT_LINK" || -L "$CURRENT_LINK" ]] || die 'Current release is missing; use installer resume or reinstall.'
   [[ -f "$env_file" ]] || die 'Runtime environment is missing; automatic secret reconstruction is intentionally refused.'
   load_repair_runtime_context
+  if declare -F private_python_repair_for_layout >/dev/null 2>&1; then
+    private_python_repair_for_layout || die 'Private Python repair failed; refusing to continue with an invalid owned runtime.'
+  fi
   restore_provenance_from_release || warn 'Could not repair build provenance from release metadata.'
   install_rmcp_launcher
   if [[ "$SERVICE_BACKEND" == systemd ]]; then

@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 jobs:
-  debian11-python39-real-artifact:
+  python39-clean-container-real-artifact:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -25,27 +25,27 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
-      - name: Real CPython artifact on Python 3.9-only Debian 11 lifecycle
+      - name: Real CPython artifact on Python 3.9-only clean container lifecycle
         shell: bash
         run: |
           set -euo pipefail
           docker run --rm \
             -e EXPECTED_SHA="$EXPECTED_SHA" \
             -v "$GITHUB_WORKSPACE:/src:ro" \
-            debian:11-slim bash -lc '
+            python:3.9-slim-bookworm bash -lc '
               set -euo pipefail
               export DEBIAN_FRONTEND=noninteractive
               apt-get update -qq
               apt-get install -y --no-install-recommends \
-                ca-certificates curl tar openssl openssh-client procps iproute2 python3
+                ca-certificates curl tar openssl openssh-client procps iproute2
 
               system_python="$(python3 -c '\''import sys; print(".".join(map(str, sys.version_info[:3])))'\'')"
               echo "SYSTEM_PYTHON=$system_python"
-              case "$system_python" in 3.9.*) ;; *) echo "Expected Debian 11 Python 3.9, got $system_python" >&2; exit 2 ;; esac
+              case "$system_python" in 3.9.*) ;; *) echo "Expected Python 3.9-only container, got $system_python" >&2; exit 2 ;; esac
 
               export RHMCP_LANGUAGE=en_US
               export RHMCP_PYTHON_BIN=
-              export RHMCP_PYTHON_CANDIDATES=/usr/bin/python3
+              export RHMCP_PYTHON_CANDIDATES="$(command -v python3)"
               export RHMCP_PRIVATE_PYTHON_CHOICE=1
               export RHMCP_RESOLVED_COMMIT="$EXPECTED_SHA"
               export RHMCP_REQUESTED_REF="$EXPECTED_SHA"

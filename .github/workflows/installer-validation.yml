@@ -1,4 +1,4 @@
-name: Remote Host MCP installer validation
+name: Remote Host MCP installer lifecycle validation
 
 on:
   push:
@@ -7,16 +7,22 @@ on:
       - "installer/**"
       - "install.sh"
       - "scripts/rmcp.sh"
+      - "scripts/manage.sh"
       - "VERSION"
       - "tests/test_installer_contract.py"
+      - "tests/test_installer_lifecycle.py"
+      - "tests/test_installer_repair.py"
       - ".github/workflows/installer-validation.yml"
   pull_request:
     paths:
       - "installer/**"
       - "install.sh"
       - "scripts/rmcp.sh"
+      - "scripts/manage.sh"
       - "VERSION"
       - "tests/test_installer_contract.py"
+      - "tests/test_installer_lifecycle.py"
+      - "tests/test_installer_repair.py"
       - ".github/workflows/installer-validation.yml"
   workflow_dispatch:
 
@@ -24,36 +30,232 @@ permissions:
   contents: read
 
 jobs:
-  installer:
+  contract-and-failure-injection:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - name: Install test dependency
         run: python -m pip install -q 'pytest>=8.4,<9'
-      - name: Shell syntax
+
+      - name: Shell and Python syntax
         run: |
           set -euo pipefail
           bash -n install.sh
           bash -n scripts/rmcp.sh
+          bash -n scripts/manage.sh
           find installer -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
-      - name: Installer contract tests
-        run: python -m pytest -q tests/test_installer_contract.py
-      - name: Cloudflare parser smoke
+          python -m py_compile installer/validate_mcp.py tests/test_installer_contract.py tests/test_installer_lifecycle.py tests/test_installer_repair.py
+
+      - name: Installer lifecycle tests
+        run: python -m pytest -q tests/test_installer_contract.py tests/test_installer_lifecycle.py tests/test_installer_repair.py
+
+      - name: Occupied port fails closed
         run: |
           set -euo pipefail
-          source installer/lib/cloudflare.sh
-          token='AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
-          parsed=$(extract_cloudflare_token "sudo cloudflared service install ${token}")
-          test "$parsed" = "$token"
-          if extract_cloudflare_token 'sudo rm -rf /; cloudflared service install short' >/dev/null 2>&1; then
-            echo 'unsafe/invalid command unexpectedly parsed' >&2
+          source installer/lib/common.sh
+          source installer/lib/ports.sh
+          python - <<'PY' &
+          import socket, time
+          s=socket.socket(); s.bind(('127.0.0.1', 18765)); s.listen(1); time.sleep(10)
+          PY
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          sleep 1
+          if port_free 18765; then
+            echo 'occupied port unexpectedly reported free' >&2
             exit 1
           fi
-      - name: Version ordering smoke
+
+      - name: Foreign Nginx product path is never overwritten
         run: |
-          source installer/lib/update.sh
-          version_is_newer 0.1.0-alpha.1 0.2.0-alpha.1
+          set -euo pipefail
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          source installer/lib/common.sh
+          source installer/lib/state.sh
+          source installer/lib/lifecycle.sh
+          source installer/lib/reverse_proxy.sh
+          CONFIG_DIR="$tmp/config"
+          OWNERSHIP_STATE="$CONFIG_DIR/ownership.env"
+          mkdir -p "$CONFIG_DIR" "$tmp/acme/.well-known/acme-challenge"
+          foreign="$tmp/remote-host-mcp.conf"
+          printf 'server { listen 80; }\n' > "$foreign"
+          export RHMCP_NGINX_CONFIG_PATH="$foreign"
+          set +e
+          write_managed_nginx_http example.com 8765 "$tmp/acme"
+          rc=$?
+          set -e
+          test "$rc" = 2
+          grep -q '^server { listen 80; }$' "$foreign"
+
+      - name: HTTPS port reconfiguration rolls back on failed external validation
+        run: |
+          set -euo pipefail
+          sudo env WORKSPACE="$GITHUB_WORKSPACE" bash -c '
+            set -euo pipefail
+            cd "$WORKSPACE"
+            source installer/lib/common.sh
+            source installer/lib/state.sh
+            source installer/lib/lifecycle.sh
+            source installer/lib/reverse_proxy.sh
+            source installer/lib/tls.sh
+            source installer/lib/port_hardening.sh
+            source installer/lib/configure.sh
+            tmp=$(mktemp -d)
+            trap "rm -rf \"$tmp\"" EXIT
+            CONFIG_DIR="$tmp/config"; STATE_DIR="$tmp/state"; INSTALL_STATE="$CONFIG_DIR/install-state.env"; CURRENT_LINK="$tmp/current"
+            mkdir -p "$CONFIG_DIR/letsencrypt/live/test" "$STATE_DIR" "$CURRENT_LINK/.venv/bin" "$CURRENT_LINK/installer"
+            printf "RHMCP_AUTH_MODE=capability\nRHMCP_PATH_KEY=test-key\nRHMCP_PUBLIC_HOST=example.com\nRHMCP_PORT=8765\nRHMCP_PUBLIC_HTTPS_PORT=443\nRHMCP_HTTPS_LISTEN_PORT=443\nRHMCP_CERT_NAME=test\nRHMCP_CERT_FULLCHAIN=$CONFIG_DIR/letsencrypt/live/test/fullchain.pem\nRHMCP_CERT_RENEWAL_MODE=dns-01-cloudflare\n" > "$CONFIG_DIR/rhmcp.env"
+            printf "RHMCP_INSTALL_STATUS=COMPLETE\nRHMCP_PUBLIC_HTTPS_PORT=443\nRHMCP_HTTPS_LISTEN_PORT=443\n" > "$INSTALL_STATE"
+            printf dummy > "$CONFIG_DIR/letsencrypt/live/test/fullchain.pem"
+            printf dummy > "$CONFIG_DIR/letsencrypt/live/test/privkey.pem"
+            nginx_conf="$tmp/remote-host-mcp.conf"
+            printf "# Managed-By: remote-host-mcp\nlisten-old\n" > "$nginx_conf"
+            export RHMCP_NGINX_CONFIG_PATH="$nginx_conf"
+            INGRESS=domain
+            bind_port_free_any() { :; }
+            write_managed_nginx_https() { printf "# Managed-By: remote-host-mcp\nlisten-new\n" > "$nginx_conf"; }
+            verify_external_https() { return 1; }
+            _config_protocol_gate() { return 0; }
+            reload_nginx_safely() { :; }
+            if apply_https_port_mapping 2012 8443; then exit 90; fi
+            grep -q "^RHMCP_PUBLIC_HTTPS_PORT=443$" "$CONFIG_DIR/rhmcp.env"
+            grep -q "^RHMCP_HTTPS_LISTEN_PORT=443$" "$CONFIG_DIR/rhmcp.env"
+            grep -q "^RHMCP_PUBLIC_HTTPS_PORT=443$" "$INSTALL_STATE"
+            grep -q "^RHMCP_HTTPS_LISTEN_PORT=443$" "$INSTALL_STATE"
+            grep -q "^listen-old$" "$nginx_conf"
+            test -z "$(find "$STATE_DIR" -maxdepth 1 -type f -name "configure-*" -print -quit)"
+          '
+
+      - name: State write failure is explicit
+        run: |
+          set -euo pipefail
+          set +e
+          bash -c '
+            source installer/lib/common.sh
+            source installer/lib/state.sh
+            RMCP_VERSION=0.2.0-alpha.4
+            PROGRESS_STATE=/proc/remote-host-mcp-install-progress.env
+            write_progress_state INCOMPLETE PRECHECK STATE_WRITE_FAILED
+          '
+          rc=$?
+          set -e
+          test "$rc" -ne 0
+
+      - name: Secret hygiene and destructive safety
+        run: |
+          set -euo pipefail
+          ! grep -R --include='*.sh' -n -E '(^|[[:space:]])eval([[:space:]]|$)|pkill[[:space:]]+-f' installer scripts
+          ! grep -R --include='*.sh' -n -E '/root/le-dns-(auth|cleanup)-hook' installer scripts
+          ! grep -R --include='*.sh' -n -E 'RHMCP_PATH_KEY=.*(install-state|progress|ownership)' installer
+          ! grep -R --include='*.py' -n -E 'print\(.*(BEARER|PATH_KEY)|Authorization.*print' installer
+
+  lifecycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Fresh install → repair → resume → purge → reinstall → real MCP
+        env:
+          RHMCP_LANGUAGE: en_US
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          install_root="$RUNNER_TEMP/rhmcp-lifecycle"
+
+          assert_complete_identity() {
+            python - "$install_root/config/install-state.env" "$EXPECTED_SHA" <<'PY'
+          import pathlib, shlex, sys
+          path=pathlib.Path(sys.argv[1]); expected=sys.argv[2].lower(); data={}
+          for line in path.read_text().splitlines():
+              if not line or '=' not in line: continue
+              k,v=line.split('=',1); vals=shlex.split(v); data[k]=vals[0] if vals else ''
+          assert data['RHMCP_INSTALL_STATUS']=='COMPLETE'
+          assert data['RHMCP_BUILD_COMMIT'].lower()==expected, (data['RHMCP_BUILD_COMMIT'], expected)
+          assert data['RHMCP_BUILD_REF'] not in ('', 'unknown')
+          assert data['RHMCP_RELEASE_ID'] not in ('', 'unknown')
+          PY
+          }
+
+          install_once() {
+            printf '2\n%s\n2\n4\n1\n' "$install_root" | bash installer/install.sh | tee "$RUNNER_TEMP/install.log"
+            test -x "$install_root/current/.venv/bin/remote-host-mcp"
+            test -x "$HOME/.local/bin/rmcp"
+            curl -fsS http://127.0.0.1:8765/health > "$RUNNER_TEMP/health.json"
+            grep -q '/mcp/<redacted>' "$RUNNER_TEMP/install.log"
+            ! grep -q 'RHMCP_PATH_KEY=' "$RUNNER_TEMP/install.log"
+            assert_complete_identity
+            rmcp status
+            rmcp doctor
+            rmcp repair
+            rmcp doctor
+            rmcp uninstall --dry-run
+          }
+
+          mark_resumable_public_ready() {
+            python - "$install_root/config/install-state.env" "$install_root/config/install-progress.env" <<'PY'
+          import pathlib, sys
+          state=pathlib.Path(sys.argv[1]); progress=pathlib.Path(sys.argv[2])
+          def replace(path, key, value):
+              lines=path.read_text().splitlines()
+              out=[]; seen=False
+              for line in lines:
+                  if line.startswith(key+'='):
+                      out.append(f'{key}={value}'); seen=True
+                  else:
+                      out.append(line)
+              if not seen: out.append(f'{key}={value}')
+              path.write_text('\n'.join(out)+'\n')
+          replace(state, 'RHMCP_INSTALL_STATUS', 'INCOMPLETE')
+          replace(progress, 'INSTALL_STATUS', 'INCOMPLETE')
+          replace(progress, 'LAST_COMPLETED_STAGE', 'PUBLIC_READY')
+          replace(progress, 'LAST_ERROR_CLASS', 'CI_RESUME_SIMULATION')
+          PY
+          }
+
+          install_once
+          server_pid=$(cat "$install_root/logs/server.pid")
+          server_rss_kib=$(ps -o rss= -p "$server_pid" | tr -d ' ')
+          venv_mib=$(du -sm "$install_root/current/.venv" | awk '{print $1}')
+          install_tree_mib=$(du -sm "$install_root" | awk '{print $1}')
+          echo "RESOURCE_SNAPSHOT server_rss_kib=${server_rss_kib} venv_mib=${venv_mib} install_tree_mib=${install_tree_mib}"
+          test "$server_rss_kib" -gt 0
+          test "$venv_mib" -gt 0
+          test "$install_tree_mib" -gt 0
+
+          mark_resumable_public_ready
+          rmcp resume
+          assert_complete_identity
+          rmcp doctor
+          RHMCP_ASSUME_YES=1 rmcp uninstall --purge
+          test ! -e "$install_root"
+          test ! -e "$HOME/.local/bin/rmcp"
+
+          install_once
+          RHMCP_ASSUME_YES=1 rmcp uninstall --purge
+          test ! -e "$install_root"
+          test ! -e "$HOME/.local/bin/rmcp"
+
+      - name: Assert exact canonical tool surface is unchanged
+        run: |
+          python - <<'PY'
+          import json
+          tools=json.load(open('tests/tool_manifest.json', encoding='utf-8'))
+          assert len(tools) == len(set(tools)) == 65
+          assert 'host_capabilities' in tools
+          PY

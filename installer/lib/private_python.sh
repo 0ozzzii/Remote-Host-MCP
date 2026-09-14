@@ -6,8 +6,12 @@ set -euo pipefail
 # with a moving latest URL.
 RHMCP_PRIVATE_PYTHON_VERSION='3.11.16'
 RHMCP_PRIVATE_PYTHON_RELEASE='20260901'
-RHMCP_PRIVATE_PYTHON_ARTIFACT='cpython-3.11.16+20260901-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz'
-RHMCP_PRIVATE_PYTHON_SHA256='64427febea27864d136db46c8efe968eb6fa5ca2813ce1dca4bb95aec31cb2e4'
+RHMCP_PRIVATE_PYTHON_GNU_ARTIFACT='cpython-3.11.16+20260901-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz'
+RHMCP_PRIVATE_PYTHON_GNU_SHA256='64427febea27864d136db46c8efe968eb6fa5ca2813ce1dca4bb95aec31cb2e4'
+RHMCP_PRIVATE_PYTHON_MUSL_ARTIFACT='cpython-3.11.16+20260901-x86_64-unknown-linux-musl-install_only_stripped.tar.gz'
+RHMCP_PRIVATE_PYTHON_MUSL_SHA256='34418632930361c52693e6d4cfd91d3a124b5139a1bed31eb7e77d4f0a955053'
+RHMCP_PRIVATE_PYTHON_ARTIFACT="$RHMCP_PRIVATE_PYTHON_GNU_ARTIFACT"
+RHMCP_PRIVATE_PYTHON_SHA256="$RHMCP_PRIVATE_PYTHON_GNU_SHA256"
 RHMCP_PRIVATE_PYTHON_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${RHMCP_PRIVATE_PYTHON_RELEASE}/${RHMCP_PRIVATE_PYTHON_ARTIFACT}"
 RHMCP_PRIVATE_PYTHON_STAGING_ROOT="${RHMCP_PRIVATE_PYTHON_STAGING_ROOT:-}"
 RHMCP_PRIVATE_PYTHON_ARCHIVE="${RHMCP_PRIVATE_PYTHON_ARCHIVE:-}"
@@ -43,22 +47,50 @@ _private_python_marker_for_root() {
   printf '%s/.rhmcp-private-python.env\n' "${1%/}"
 }
 
-_private_python_platform_supported() {
-  local os arch libc=''
-  os="$(uname -s 2>/dev/null || true)"
-  arch="$(uname -m 2>/dev/null || true)"
-  [[ "$os" == Linux ]] || { fail "Private Python bootstrap currently supports GNU/Linux only (detected: ${os:-unknown})."; return 1; }
-  case "$arch" in x86_64|amd64) ;; *) fail "Private Python bootstrap currently supports x86_64 only (detected: ${arch:-unknown})."; return 1 ;; esac
+_private_python_detect_libc_family() {
+  local libc=''
+  if [[ "${RHMCP_TESTING:-0}" == 1 && -n "${RHMCP_PRIVATE_PYTHON_TEST_LIBC:-}" ]]; then
+    printf '%s\n' "$RHMCP_PRIVATE_PYTHON_TEST_LIBC"
+    return 0
+  fi
   if command -v getconf >/dev/null 2>&1; then libc="$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"; fi
   if [[ -z "$libc" ]] && command -v ldd >/dev/null 2>&1; then libc="$(ldd --version 2>&1 | head -n 1 || true)"; fi
   if printf '%s' "$libc" | grep -qi musl || compgen -G '/lib/ld-musl-*.so.1' >/dev/null 2>&1 || compgen -G '/usr/lib/ld-musl-*.so.1' >/dev/null 2>&1; then
-    fail 'Private Python bootstrap has no musl artifact mapping yet; refusing GNU artifact fallback.'
-    return 1
+    printf '%s\n' musl
+  elif [[ "$libc" == *glibc* || "$libc" == *GLIBC* || "$libc" == *'GNU libc'* || "$libc" == *'GNU C Library'* ]]; then
+    printf '%s\n' gnu
+  else
+    printf '%s\n' unknown
   fi
-  [[ "$libc" == *glibc* || "$libc" == *GLIBC* || "$libc" == *'GNU libc'* || "$libc" == *'GNU C Library'* ]] || {
-    fail "Could not positively identify GNU libc; refusing private Python artifact fallback (${libc:-unknown libc})."
-    return 1
-  }
+}
+
+_private_python_select_platform_artifact() {
+  local os arch libc_family
+  os="$(uname -s 2>/dev/null || true)"
+  arch="$(uname -m 2>/dev/null || true)"
+  [[ "$os" == Linux ]] || { fail "Private Python bootstrap currently supports Linux only (detected: ${os:-unknown})."; return 1; }
+  case "$arch" in x86_64|amd64) ;; *) fail "Private Python bootstrap currently supports x86_64 only (detected: ${arch:-unknown})."; return 1 ;; esac
+  libc_family="$(_private_python_detect_libc_family)"
+  case "$libc_family" in
+    gnu)
+      RHMCP_PRIVATE_PYTHON_ARTIFACT="$RHMCP_PRIVATE_PYTHON_GNU_ARTIFACT"
+      RHMCP_PRIVATE_PYTHON_SHA256="$RHMCP_PRIVATE_PYTHON_GNU_SHA256"
+      ;;
+    musl)
+      RHMCP_PRIVATE_PYTHON_ARTIFACT="$RHMCP_PRIVATE_PYTHON_MUSL_ARTIFACT"
+      RHMCP_PRIVATE_PYTHON_SHA256="$RHMCP_PRIVATE_PYTHON_MUSL_SHA256"
+      ;;
+    *)
+      fail 'Could not positively identify glibc or musl; refusing private Python artifact fallback.'
+      return 1
+      ;;
+  esac
+  RHMCP_PRIVATE_PYTHON_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${RHMCP_PRIVATE_PYTHON_RELEASE}/${RHMCP_PRIVATE_PYTHON_ARTIFACT}"
+  export RHMCP_PRIVATE_PYTHON_ARTIFACT RHMCP_PRIVATE_PYTHON_SHA256 RHMCP_PRIVATE_PYTHON_URL
+}
+
+_private_python_platform_supported() {
+  _private_python_select_platform_artifact
 }
 
 _private_python_marker_matches() {
@@ -69,7 +101,9 @@ _private_python_marker_matches() {
   release="$(sed -n 's/^RHMCP_PRIVATE_PYTHON_RELEASE=//p' "$marker" | head -n1)"
   artifact="$(sed -n 's/^RHMCP_PRIVATE_PYTHON_ARTIFACT=//p' "$marker" | head -n1)"
   sha="$(sed -n 's/^RHMCP_PRIVATE_PYTHON_SHA256=//p' "$marker" | head -n1)"
-  [[ "$version" == "$RHMCP_PRIVATE_PYTHON_VERSION" && "$release" == "$RHMCP_PRIVATE_PYTHON_RELEASE" && "$artifact" == "$RHMCP_PRIVATE_PYTHON_ARTIFACT" && "$sha" == "$RHMCP_PRIVATE_PYTHON_SHA256" ]]
+  [[ "$version" == "$RHMCP_PRIVATE_PYTHON_VERSION" && "$release" == "$RHMCP_PRIVATE_PYTHON_RELEASE" ]] || return 1
+  [[ "$artifact" == "$RHMCP_PRIVATE_PYTHON_GNU_ARTIFACT" && "$sha" == "$RHMCP_PRIVATE_PYTHON_GNU_SHA256" ]] && return 0
+  [[ "$artifact" == "$RHMCP_PRIVATE_PYTHON_MUSL_ARTIFACT" && "$sha" == "$RHMCP_PRIVATE_PYTHON_MUSL_SHA256" ]]
 }
 
 _private_python_runtime_healthy() {
@@ -176,22 +210,35 @@ _private_python_use_existing_if_healthy() {
   export RHMCP_PYTHON_BIN RHMCP_PRIVATE_PYTHON_ACTIVE
 }
 
+_private_python_text() {
+  local key="$1" fallback="$2" value=''
+  if declare -F t >/dev/null 2>&1; then
+    value="$(t "$key")"
+    if [[ -n "$value" && "$value" != "$key" ]]; then
+      printf '%s' "$value"
+      return 0
+    fi
+  fi
+  printf '%s' "$fallback"
+}
+
 private_python_select_or_bootstrap() {
   local choice candidate
   if _private_python_use_existing_if_healthy; then
-    ok "Product-owned Python ${RHMCP_PRIVATE_PYTHON_VERSION}"
+    printf -v candidate "$(_private_python_text private_python_using 'Product-owned Python %s')" "$RHMCP_PRIVATE_PYTHON_VERSION"
+    ok "$candidate"
     return 0
   fi
-  printf '\nNo usable Python >= 3.10 was found. / 未发现可用的 Python >= 3.10。\n'
-  printf '  1. Install Remote Host MCP private Python %s [recommended]\n' "$RHMCP_PRIVATE_PYTHON_VERSION"
-  printf '  2. Specify an existing Python path\n'
-  printf '  3. Exit\n'
+  printf '\n%s\n' "$(_private_python_text python_missing 'No usable Python >= 3.10 was found.')"
+  printf '  1. '; printf "$(_private_python_text private_python_install 'Install Remote Host MCP private Python %s [recommended]')" "$RHMCP_PRIVATE_PYTHON_VERSION"; printf '\n'
+  printf '  2. %s\n' "$(_private_python_text private_python_existing 'Specify an existing Python path')"
+  printf '  3. %s\n' "$(_private_python_text private_python_exit 'Exit')"
   choice="${RHMCP_PRIVATE_PYTHON_CHOICE:-}"
   if [[ -z "$choice" ]]; then
     if [[ -t 0 ]]; then
-      read -r -p 'Select [1-3, default 1]: ' choice || true
+      read -r -p "$(_private_python_text private_python_select 'Select [1-3, default 1]: ')" choice || true
     else
-      fail 'Non-interactive install requires RHMCP_PRIVATE_PYTHON_CHOICE=1 (bootstrap), 2 (existing path), or 3 (exit).'
+      fail "$(_private_python_text private_python_noninteractive 'Non-interactive install requires RHMCP_PRIVATE_PYTHON_CHOICE=1 (bootstrap), 2 (existing path), or 3 (exit).')"
       return 1
     fi
   fi
@@ -201,8 +248,8 @@ private_python_select_or_bootstrap() {
       ;;
     2)
       candidate="${RHMCP_PRIVATE_PYTHON_EXISTING_BIN:-}"
-      if [[ -z "$candidate" ]]; then read -r -p 'Absolute Python path: ' candidate; fi
-      [[ "$candidate" = /* ]] || { fail 'Python path must be absolute.'; return 1; }
+      if [[ -z "$candidate" ]]; then read -r -p "$(_private_python_text private_python_existing_path 'Absolute Python path: ')" candidate; fi
+      [[ "$candidate" = /* ]] || { fail "$(_private_python_text private_python_path_absolute 'Python path must be absolute.')"; return 1; }
       RHMCP_PYTHON_BIN="$candidate"; export RHMCP_PYTHON_BIN
       select_python_interpreter
       ;;
@@ -210,7 +257,7 @@ private_python_select_or_bootstrap() {
       return 1
       ;;
     *)
-      fail 'Invalid private Python selection.'
+      fail "$(_private_python_text private_python_invalid 'Invalid private Python selection.')"
       return 1
       ;;
   esac

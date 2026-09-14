@@ -8,6 +8,7 @@ import tarfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 COMMON = ROOT / "installer" / "lib" / "common.sh"
+I18N = ROOT / "installer" / "lib" / "i18n.sh"
 STATE = ROOT / "installer" / "lib" / "state.sh"
 PORTS = ROOT / "installer" / "lib" / "ports.sh"
 UNINSTALL = ROOT / "installer" / "lib" / "uninstall.sh"
@@ -78,8 +79,45 @@ def test_pin_is_exact_and_not_latest() -> None:
     assert "RHMCP_PRIVATE_PYTHON_RELEASE='20260901'" in text
     assert "64427febea27864d136db46c8efe968eb6fa5ca2813ce1dca4bb95aec31cb2e4" in text
     assert "unknown-linux-gnu-install_only_stripped.tar.gz" in text
+    assert "34418632930361c52693e6d4cfd91d3a124b5139a1bed31eb7e77d4f0a955053" in text
+    assert "unknown-linux-musl-install_only_stripped.tar.gz" in text
     assert "latest-release" not in text
 
+
+def test_musl_x86_64_selects_pinned_musl_artifact() -> None:
+    result = run_bash(
+        f'''source {COMMON}; _private_python_platform_supported; printf '%s\n%s\n%s\n' "$RHMCP_PRIVATE_PYTHON_ARTIFACT" "$RHMCP_PRIVATE_PYTHON_SHA256" "$RHMCP_PRIVATE_PYTHON_URL"''',
+        env={"RHMCP_TESTING": "1", "RHMCP_PRIVATE_PYTHON_TEST_LIBC": "musl"},
+    )
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.strip().splitlines()
+    assert lines[0] == "cpython-3.11.16+20260901-x86_64-unknown-linux-musl-install_only_stripped.tar.gz"
+    assert lines[1] == "34418632930361c52693e6d4cfd91d3a124b5139a1bed31eb7e77d4f0a955053"
+    assert lines[2].endswith("/" + lines[0])
+
+
+def test_gnu_x86_64_keeps_pinned_gnu_artifact() -> None:
+    result = run_bash(
+        f'''source {COMMON}; _private_python_platform_supported; printf '%s\n%s\n' "$RHMCP_PRIVATE_PYTHON_ARTIFACT" "$RHMCP_PRIVATE_PYTHON_SHA256"''',
+        env={"RHMCP_TESTING": "1", "RHMCP_PRIVATE_PYTHON_TEST_LIBC": "gnu"},
+    )
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.strip().splitlines()
+    assert lines[0] == "cpython-3.11.16+20260901-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+    assert lines[1] == "64427febea27864d136db46c8efe968eb6fa5ca2813ce1dca4bb95aec31cb2e4"
+
+
+def test_chinese_private_python_menu_is_localized() -> None:
+    result = run_bash(
+        f"source {I18N}; load_locale zh_CN; source {COMMON}; private_python_select_or_bootstrap || true",
+        env={"RHMCP_PRIVATE_PYTHON_CHOICE": "3"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert "未发现可用的 Python >= 3.10。" in result.stdout
+    assert "安装 Remote Host MCP 私有 Python 3.11.16【推荐】" in result.stdout
+    assert "指定已有 Python 路径" in result.stdout
+    assert "  3. 退出" in result.stdout
+    assert "Install Remote Host MCP private Python" not in result.stdout
 
 def test_supported_system_python_bypasses_private_bootstrap() -> None:
     result = run_bash(

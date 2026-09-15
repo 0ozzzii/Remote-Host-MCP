@@ -47,6 +47,9 @@ INSTALL_TRACKING=false
 INSTALL_COMPLETE=false
 PROMOTED=false
 LOCAL_VALIDATED=false
+# --non-interactive / RHMCP_NON_INTERACTIVE=1: fail closed on missing required
+# values instead of prompting. See non_interactive() in installer/lib/common.sh.
+RHMCP_NON_INTERACTIVE="${RHMCP_NON_INTERACTIVE:-0}"
 
 parse_args() {
   while (($#)); do
@@ -55,14 +58,19 @@ parse_args() {
       --repair) ACTION=repair ;;
       --diagnose) ACTION=diagnose ;;
       --uninstall-incomplete) ACTION=uninstall-incomplete ;;
+      --non-interactive) RHMCP_NON_INTERACTIVE=1 ;;
       --help|-h)
-        printf 'Usage: install.sh [--resume|--repair|--diagnose|--uninstall-incomplete]\n'
+        printf 'Usage: install.sh [--resume|--repair|--diagnose|--uninstall-incomplete] [--non-interactive]\n'
+        printf '\n  --non-interactive  Every required value must be supplied as an RHMCP_* environment\n'
+        printf '                     variable; a missing value aborts instead of prompting.\n'
+        printf '                     非交互模式：必需值全部通过 RHMCP_* 环境变量提供，缺失即报错退出。\n'
         exit 0
         ;;
       *) die "Unknown installer argument: $1" ;;
     esac
     shift
   done
+  export RHMCP_NON_INTERACTIVE
 }
 
 prime_state_context() {
@@ -121,6 +129,11 @@ stage_done() {
 
 select_language() {
   if [[ -n "${RHMCP_LANGUAGE:-}" ]]; then load_locale "$RHMCP_LANGUAGE"; return; fi
+  if non_interactive; then
+    info 'Non-interactive: RHMCP_LANGUAGE unset, defaulting to en_US / 未设置 RHMCP_LANGUAGE，使用默认 en_US'
+    load_locale en_US
+    return
+  fi
   clear 2>/dev/null || true
   hr
   printf ' Remote Host MCP Installer %s\n' "$RMCP_VERSION"
@@ -428,6 +441,9 @@ configure_cloudflare_dns_secret() {
   elif [[ -n "${RHMCP_CF_DNS_TOKEN:-}" ]]; then
     token="$RHMCP_CF_DNS_TOKEN"
   else
+    if non_interactive; then
+      ni_missing RHMCP_CF_DNS_TOKEN 'Cloudflare DNS API token, or set RHMCP_CF_DNS_TOKEN_SOURCE to a token file'
+    fi
     printf 'Cloudflare DNS API token (Zone DNS Edit + Zone Read, target zone only): '
     read -r -s token; printf '\n'
   fi
@@ -458,6 +474,7 @@ configure_ingress() {
           configure_managed_cloudflare_tunnel "$PUBLIC_HOST" "$input"
           unset input
         else
+          if non_interactive; then ni_missing RHMCP_CF_TUNNEL_TOKEN 'Cloudflare Tunnel credential JSON'; fi
           printf '\n%s\n' "$(t tunnel_paste)"
           read -r -p '> ' input
           configure_managed_cloudflare_tunnel "$PUBLIC_HOST" "$input"
@@ -503,6 +520,7 @@ mcp_final_validation() {
   else
     url="${base}/mcp"
     if [[ -z "$bearer" ]]; then
+      if non_interactive; then ni_missing RHMCP_VALIDATION_BEARER_TOKEN 'OAuth final MCP validation bearer token'; fi
       printf 'OAuth validation bearer token (used once; not stored): '
       read -r -s bearer; printf '\n'
     fi
@@ -561,6 +579,7 @@ handle_existing_transaction() {
         *) die "Invalid RHMCP_INCOMPLETE_ACTION: ${RHMCP_INCOMPLETE_ACTION} (expected resume|diagnose|purge|exit)." ;;
       esac
     else
+      if non_interactive; then ni_missing RHMCP_INCOMPLETE_ACTION 'incomplete transaction handling: resume|diagnose|purge|exit'; fi
       read -r -p 'Select [0-3]: ' choice
     fi
     case "$choice" in 1) ACTION=resume ;; 2) ACTION=diagnose ;; 3) ACTION=uninstall-incomplete ;; *) exit 0 ;; esac

@@ -63,6 +63,12 @@ choose_port() {
   fi
   owner="$(port_owner "$preferred" || true)"
   warn "$(t port_busy): $preferred${owner:+ — $owner}"
+  if non_interactive; then
+    fail "Preferred local port ${preferred} is already in use; --non-interactive cannot show the port menu."
+    fail "首选本地端口 ${preferred} 已被占用，非交互模式无法展示端口选择菜单。"
+    fail 'Set RHMCP_LOCAL_PORT=<free port> and re-run. / 请设置 RHMCP_LOCAL_PORT=<可用端口> 后重试。'
+    exit 1
+  fi
   while true; do
     printf '  1. %s\n' "$(t port_auto)"
     printf '  2. %s\n' "$(t port_custom)"

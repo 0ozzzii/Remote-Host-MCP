@@ -155,6 +155,11 @@ configure_network_menu() {
     apply_https_port_mapping "$new_public" "$new_listen" || true
     return 0
   fi
+  if non_interactive; then
+    fail 'Non-interactive configure requires RHMCP_PUBLIC_HTTPS_PORT and/or RHMCP_HTTPS_LISTEN_PORT.'
+    fail '非交互配置需要设置 RHMCP_PUBLIC_HTTPS_PORT 和/或 RHMCP_HTTPS_LISTEN_PORT。'
+    return 2
+  fi
   while true; do
     current_public="$(_config_env_get RHMCP_PUBLIC_HTTPS_PORT 2>/dev/null || printf '443')"
     current_listen="$(_config_env_get RHMCP_HTTPS_LISTEN_PORT 2>/dev/null || printf '%s' "$current_public")"

@@ -99,6 +99,25 @@ python3() {
   command "$bin" "$@"
 }
 
+# Non-interactive mode (--non-interactive / RHMCP_NON_INTERACTIVE=1) turns every
+# missing required value into a hard failure instead of a prompt. Defaults are
+# only ever applied to prompts that document a bracketed default.
+non_interactive() {
+  case "${RHMCP_NON_INTERACTIVE:-0}" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+ni_missing() {
+  local name="$1" what="${2:-}"
+  fail "Non-interactive install is missing a required value: ${name}${what:+ (${what})}"
+  fail "非交互安装缺少必需变量：${name}${what:+（${what}）}"
+  fail "Re-run with ${name}=<value>, or run the installer interactively without --non-interactive."
+  fail "请设置 ${name}=<值> 后重试，或不带 --non-interactive 交互式运行安装器。"
+  exit 1
+}
+
 # Operator prompts can be satisfied from the environment. When the matching
 # RHMCP_* variable is already set the prompt is skipped and the supplied value is
 # used verbatim; when it is unset the historical interactive behaviour is kept
@@ -121,6 +140,7 @@ ni_prompt() {
     printf -v "$target" '%s' "$value"
     return 0
   fi
+  if non_interactive; then ni_missing "$name" "$prompt"; fi
   read -r -p "$prompt" value || true
   printf -v "$target" '%s' "$value"
 }
@@ -130,8 +150,13 @@ ni_prompt_default() {
   local target="$1" name="$2" prompt="$3" fallback="${4:-}" value
   value="${!name:-}"
   if [[ -z "$value" ]]; then
-    read -r -p "$prompt" value || true
-    value="${value:-$fallback}"
+    if non_interactive; then
+      value="$fallback"
+      info "Non-interactive: ${name} unset, using default '${fallback}' / ${name} 未设置，使用默认值 '${fallback}'"
+    else
+      read -r -p "$prompt" value || true
+      value="${value:-$fallback}"
+    fi
   fi
   printf -v "$target" '%s' "$value"
 }
@@ -139,6 +164,9 @@ ni_prompt_default() {
 confirm() {
   local prompt="${1:-$(t confirm)}" answer
   if [[ "${RHMCP_ASSUME_YES:-0}" == 1 ]]; then return 0; fi
+  if non_interactive; then
+    ni_missing RHMCP_ASSUME_YES "confirmation required: ${prompt}"
+  fi
   read -r -p "$prompt [y/N]: " answer || true
   [[ "$answer" =~ ^[Yy]$ ]]
 }

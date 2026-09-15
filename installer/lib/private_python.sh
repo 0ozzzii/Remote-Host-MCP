@@ -264,6 +264,10 @@ private_python_select_or_bootstrap() {
   printf '  3. %s\n' "$(_private_python_text private_python_exit 'Exit')"
   choice="${RHMCP_PRIVATE_PYTHON_CHOICE:-}"
   if [[ -z "$choice" ]]; then
+    if non_interactive; then
+      fail "$(_private_python_text private_python_noninteractive 'Non-interactive install requires RHMCP_PRIVATE_PYTHON_CHOICE=1 (bootstrap), 2 (existing path), or 3 (exit).')"
+      return 1
+    fi
     if [[ -t 0 ]]; then
       read -r -p "$(_private_python_text private_python_select 'Select [1-3, default 1]: ')" choice || true
     else
@@ -277,7 +281,13 @@ private_python_select_or_bootstrap() {
       ;;
     2)
       candidate="${RHMCP_PRIVATE_PYTHON_EXISTING_BIN:-}"
-      if [[ -z "$candidate" ]]; then read -r -p "$(_private_python_text private_python_existing_path 'Absolute Python path: ')" candidate; fi
+      if [[ -z "$candidate" ]]; then
+        if non_interactive; then
+          fail "$(_private_python_text private_python_noninteractive 'Non-interactive install requires RHMCP_PRIVATE_PYTHON_EXISTING_BIN=<absolute python path>.')"
+          return 1
+        fi
+        read -r -p "$(_private_python_text private_python_existing_path 'Absolute Python path: ')" candidate
+      fi
       [[ "$candidate" = /* ]] || { fail "$(_private_python_text private_python_path_absolute 'Python path must be absolute.')"; return 1; }
       RHMCP_PYTHON_BIN="$candidate"; export RHMCP_PYTHON_BIN
       select_python_interpreter

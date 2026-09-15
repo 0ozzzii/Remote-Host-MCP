@@ -17,9 +17,9 @@ choose_layout() {
   printf '  1. %s\n' "$(t mode_standard)"
   printf '  2. %s\n' "$(t mode_persistent)"
   printf '  3. %s\n' "$(t mode_custom)"
-  read -r -p 'Select / 选择 [1-3]: ' choice
+  ni_prompt choice RHMCP_INSTALL_MODE 'Select / 选择 [1-3]: ' '1 system 2 prefix 3 custom'
   case "$choice" in
-    1)
+    1|system)
       [[ $EUID -eq 0 ]] || die 'Standard system install requires root/sudo. / 标准系统安装需要 root/sudo。'
       INSTALL_MODE=system
       CODE_BASE=/opt/remote-host-mcp
@@ -30,10 +30,9 @@ choose_layout() {
       BACKUP_DIR=/var/lib/remote-host-mcp/backups
       RUNTIME_DIR=/var/lib/remote-host-mcp/runtime
       ;;
-    2)
+    2|prefix)
       INSTALL_MODE=prefix
-      read -r -p "Install root / 安装根目录 [${default_base}]: " base
-      base="${base:-$default_base}"
+      ni_prompt_default base RHMCP_INSTALL_ROOT "Install root / 安装根目录 [${default_base}]: " "$default_base"
       [[ "$base" = /* ]] || die 'Install root must be absolute. / 安装根目录必须是绝对路径。'
       CODE_BASE="$base"
       CONFIG_DIR="$base/config"
@@ -43,9 +42,9 @@ choose_layout() {
       BACKUP_DIR="$base/backups"
       RUNTIME_DIR="$base/runtime"
       ;;
-    3)
+    3|custom)
       INSTALL_MODE=prefix
-      read -r -p 'Absolute install root / 绝对安装根目录: ' base
+      ni_prompt base RHMCP_INSTALL_ROOT 'Absolute install root / 绝对安装根目录: '
       [[ "$base" = /* ]] || die 'Install root must be absolute. / 安装根目录必须是绝对路径。'
       CODE_BASE="$base"
       CONFIG_DIR="$base/config"

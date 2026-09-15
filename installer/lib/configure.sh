@@ -145,6 +145,16 @@ apply_https_port_mapping() {
 
 configure_network_menu() {
   local choice current_public current_listen input new_public new_listen
+  # Environment short-circuit: an explicitly supplied mapping is applied without
+  # walking the menu, so `rmcp configure` can be driven from a remote panel.
+  current_public="$(_config_env_get RHMCP_PUBLIC_HTTPS_PORT 2>/dev/null || printf '443')"
+  current_listen="$(_config_env_get RHMCP_HTTPS_LISTEN_PORT 2>/dev/null || printf '%s' "$current_public")"
+  if [[ -n "${RHMCP_PUBLIC_HTTPS_PORT:-}" || -n "${RHMCP_HTTPS_LISTEN_PORT:-}" ]]; then
+    new_public="${RHMCP_PUBLIC_HTTPS_PORT:-$current_public}"
+    new_listen="${RHMCP_HTTPS_LISTEN_PORT:-$current_listen}"
+    apply_https_port_mapping "$new_public" "$new_listen" || true
+    return 0
+  fi
   while true; do
     current_public="$(_config_env_get RHMCP_PUBLIC_HTTPS_PORT 2>/dev/null || printf '443')"
     current_listen="$(_config_env_get RHMCP_HTTPS_LISTEN_PORT 2>/dev/null || printf '%s' "$current_public")"
@@ -158,20 +168,20 @@ configure_network_menu() {
     read -r -p 'Select / 选择 [0-3]: ' choice
     case "$choice" in
       1)
-        read -r -p "Public HTTPS port [${current_public}]: " input
-        new_public="${input:-$current_public}"
+        ni_prompt_default input RHMCP_PUBLIC_HTTPS_PORT "Public HTTPS port [${current_public}]: " "$current_public"
+        new_public="$input"
         apply_https_port_mapping "$new_public" "$current_listen" || true
         ;;
       2)
-        read -r -p "Local HTTPS listen port [${current_listen}]: " input
-        new_listen="${input:-$current_listen}"
+        ni_prompt_default input RHMCP_HTTPS_LISTEN_PORT "Local HTTPS listen port [${current_listen}]: " "$current_listen"
+        new_listen="$input"
         apply_https_port_mapping "$current_public" "$new_listen" || true
         ;;
       3)
-        read -r -p "Public HTTPS port [${current_public}]: " input
-        new_public="${input:-$current_public}"
-        read -r -p "Local HTTPS listen port [${current_listen}] (usually same; change only for provider/NAT mapping): " input
-        new_listen="${input:-$current_listen}"
+        ni_prompt_default input RHMCP_PUBLIC_HTTPS_PORT "Public HTTPS port [${current_public}]: " "$current_public"
+        new_public="$input"
+        ni_prompt_default input RHMCP_HTTPS_LISTEN_PORT "Local HTTPS listen port [${current_listen}] (usually same; change only for provider/NAT mapping): " "$current_listen"
+        new_listen="$input"
         apply_https_port_mapping "$new_public" "$new_listen" || true
         ;;
       0) return 0 ;;

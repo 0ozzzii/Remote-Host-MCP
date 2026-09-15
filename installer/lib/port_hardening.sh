@@ -8,7 +8,7 @@ set -euo pipefail
 
 ensure_nginx_for_direct() {
   local require_http80="${1:-true}" https_listen_port="${2:-${HTTPS_LISTEN_PORT:-${PUBLIC_HTTPS_PORT:-443}}}"
-  local proxy answer installed=false
+  local proxy installed=false
   [[ $EUID -eq 0 ]] || die 'Managed direct HTTPS requires root/sudo.'
   proxy="$(detect_proxy)"
   case "$proxy" in
@@ -28,12 +28,10 @@ ensure_nginx_for_direct() {
   fi
 
   if ! command -v nginx >/dev/null 2>&1; then
-    if [[ "${RHMCP_AUTO_INSTALL_DEPS:-0}" == 1 ]]; then
+    if [[ "${RHMCP_AUTO_INSTALL_DEPS:-0}" == 1 ]] || confirm 'Nginx is required for managed HTTPS. Install it now?'; then
       install_nginx_dependency
     else
-      read -r -p 'Nginx is required for managed HTTPS. Install it now? [y/N]: ' answer || true
-      [[ "$answer" =~ ^[Yy]$ ]] || die 'Nginx is required for managed direct HTTPS.'
-      install_nginx_dependency
+      die 'Nginx is required for managed direct HTTPS.'
     fi
     installed=true
   fi

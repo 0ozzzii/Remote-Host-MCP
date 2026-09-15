@@ -99,8 +99,46 @@ python3() {
   command "$bin" "$@"
 }
 
+# Operator prompts can be satisfied from the environment. When the matching
+# RHMCP_* variable is already set the prompt is skipped and the supplied value is
+# used verbatim; when it is unset the historical interactive behaviour is kept
+# exactly as-is. This is what lets a remote panel drive the installer.
+ni_prompt() {
+  local target="$1" name="$2" prompt="$3" allowed="${4:-}" value token ok
+  value="${!name:-}"
+  if [[ -n "$value" ]]; then
+    if [[ -n "$allowed" ]]; then
+      ok=0
+      for token in $allowed; do
+        if [[ "$value" == "$token" ]]; then ok=1; break; fi
+      done
+      if (( ok == 0 )); then
+        fail "Invalid ${name}: '${value}' / ${name} 取值无效：'${value}'"
+        fail "Allowed / 允许值: ${allowed// /, }"
+        exit 1
+      fi
+    fi
+    printf -v "$target" '%s' "$value"
+    return 0
+  fi
+  read -r -p "$prompt" value || true
+  printf -v "$target" '%s' "$value"
+}
+
+# Same as ni_prompt for prompts that accept an empty answer (bracketed default).
+ni_prompt_default() {
+  local target="$1" name="$2" prompt="$3" fallback="${4:-}" value
+  value="${!name:-}"
+  if [[ -z "$value" ]]; then
+    read -r -p "$prompt" value || true
+    value="${value:-$fallback}"
+  fi
+  printf -v "$target" '%s' "$value"
+}
+
 confirm() {
   local prompt="${1:-$(t confirm)}" answer
+  if [[ "${RHMCP_ASSUME_YES:-0}" == 1 ]]; then return 0; fi
   read -r -p "$prompt [y/N]: " answer || true
   [[ "$answer" =~ ^[Yy]$ ]]
 }

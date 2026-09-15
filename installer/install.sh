@@ -169,19 +169,19 @@ choose_authority() {
   header "$(t authority)"
   printf '  1. %s\n  2. %s\n' "$(t authority_root)" "$(t authority_user)"
   local choice
-  read -r -p 'Select / 选择 [1-2]: ' choice
+  ni_prompt choice RHMCP_AUTHORITY 'Select / 选择 [1-2]: ' '1 root 2 user'
   case "$choice" in
-    1)
+    1|root)
       warn "$(t authority_warning)"
       confirm || die 'Cancelled / 已取消'
       [[ $EUID -eq 0 ]] || die 'Full host control requires root/sudo. / 完整主机控制需要 root/sudo。'
       AUTHORITY=root; SERVICE_USER=root
       ;;
-    2)
+    2|user)
       AUTHORITY=user
       if [[ $EUID -eq 0 ]]; then
-        SERVICE_USER="${SUDO_USER:-}"
-        if [[ -z "$SERVICE_USER" || "$SERVICE_USER" == root ]]; then read -r -p 'Linux service user / Linux 运行用户: ' SERVICE_USER; fi
+        SERVICE_USER="${RHMCP_SERVICE_USER:-${SUDO_USER:-}}"
+        if [[ -z "$SERVICE_USER" || "$SERVICE_USER" == root ]]; then ni_prompt SERVICE_USER RHMCP_SERVICE_USER 'Linux service user / Linux 运行用户: '; fi
         id "$SERVICE_USER" >/dev/null 2>&1 || die 'Unknown Linux user / Linux 用户不存在'
       else SERVICE_USER="$(id -un)"; fi
       ;;
@@ -193,9 +193,9 @@ choose_auth() {
   header "$(t auth)"
   printf '  1. %s\n  2. %s\n' "$(t auth_capability)" "$(t auth_oauth)"
   local choice default_audience url scheme_host
-  read -r -p 'Select / 选择 [1-2]: ' choice
+  ni_prompt choice RHMCP_AUTH_MODE 'Select / 选择 [1-2]: ' '1 capability 2 oauth'
   case "$choice" in
-    1)
+    1|capability)
       AUTH_MODE=capability
       PATH_KEY="$(python3 - <<'PY'
 import secrets
@@ -203,11 +203,11 @@ print(secrets.token_urlsafe(48))
 PY
 )"
       ;;
-    2)
+    2|oauth)
       AUTH_MODE=oauth
       PATH_KEY=''
-      read -r -p 'OAuth issuer (https://...) / OAuth Issuer: ' OAUTH_ISSUER
-      read -r -p 'JWKS URL (https://...) / JWKS 地址: ' OAUTH_JWKS_URL
+      ni_prompt OAUTH_ISSUER RHMCP_OAUTH_ISSUER 'OAuth issuer (https://...) / OAuth Issuer: '
+      ni_prompt OAUTH_JWKS_URL RHMCP_OAUTH_JWKS_URL 'JWKS URL (https://...) / JWKS 地址: '
       if [[ "$INGRESS" == private ]]; then
         scheme_host="http://127.0.0.1:${LOCAL_PORT}"
       elif [[ "$PUBLIC_HTTPS_PORT" == 443 ]]; then
@@ -216,10 +216,8 @@ PY
         scheme_host="https://${PUBLIC_HOST}:${PUBLIC_HTTPS_PORT}"
       fi
       default_audience="${scheme_host}/mcp"
-      read -r -p "OAuth audience [${default_audience}]: " OAUTH_AUDIENCE
-      OAUTH_AUDIENCE="${OAUTH_AUDIENCE:-$default_audience}"
-      read -r -p 'OAuth scopes [remote-host]: ' OAUTH_SCOPES
-      OAUTH_SCOPES="${OAUTH_SCOPES:-remote-host}"
+      ni_prompt_default OAUTH_AUDIENCE RHMCP_OAUTH_AUDIENCE "OAuth audience [${default_audience}]: " "$default_audience"
+      ni_prompt_default OAUTH_SCOPES RHMCP_OAUTH_SCOPES 'OAuth scopes [remote-host]: ' 'remote-host'
       for url in "$OAUTH_ISSUER" "$OAUTH_JWKS_URL"; do [[ "$url" == https://* ]] || die 'OAuth issuer/JWKS URLs must use https://'; done
       ;;
     *) die 'Invalid selection / 无效选项' ;;
@@ -227,12 +225,9 @@ PY
 }
 
 read_https_ports() {
-  local input
-  read -r -p 'Public HTTPS port [443]: ' input
-  PUBLIC_HTTPS_PORT="${input:-443}"
+  ni_prompt_default PUBLIC_HTTPS_PORT RHMCP_PUBLIC_HTTPS_PORT 'Public HTTPS port [443]: ' '443'
   [[ "$PUBLIC_HTTPS_PORT" =~ ^[0-9]+$ && "$PUBLIC_HTTPS_PORT" -ge 1 && "$PUBLIC_HTTPS_PORT" -le 65535 ]] || die 'Invalid public HTTPS port.'
-  read -r -p "Local HTTPS listen port [${PUBLIC_HTTPS_PORT}] (Enter=same; change only for provider/NAT mapping): " input
-  HTTPS_LISTEN_PORT="${input:-$PUBLIC_HTTPS_PORT}"
+  ni_prompt_default HTTPS_LISTEN_PORT RHMCP_HTTPS_LISTEN_PORT "Local HTTPS listen port [${PUBLIC_HTTPS_PORT}] (Enter=same; change only for provider/NAT mapping): " "$PUBLIC_HTTPS_PORT"
   [[ "$HTTPS_LISTEN_PORT" =~ ^[0-9]+$ && "$HTTPS_LISTEN_PORT" -ge 1 && "$HTTPS_LISTEN_PORT" -le 65535 ]] || die 'Invalid local HTTPS listen port.'
 }
 
@@ -240,55 +235,55 @@ choose_ingress() {
   header "$(t ingress)"
   printf '  1. Public IP HTTPS\n  2. Domain HTTPS\n  3. Cloudflare Tunnel\n  4. Private/local only\n'
   local choice host mode challenge
-  read -r -p 'Select / 选择 [1-4]: ' choice
+  ni_prompt choice RHMCP_INGRESS_PROFILE 'Select / 选择 [1-4]: ' '1 public-ip 2 domain 3 cloudflare-tunnel 4 private'
   case "$choice" in
-    1)
+    1|public-ip)
       INGRESS=public-ip
-      read -r -p 'Public IPv4 address: ' host
+      ni_prompt host RHMCP_PUBLIC_HOST 'Public IPv4 address: '
       valid_ipv4 "$host" || die 'Invalid public IPv4 address.'
       PUBLIC_HOST="$host"
       read_https_ports
-      read -r -p 'ACME contact email: ' ACME_EMAIL
+      ni_prompt ACME_EMAIL RHMCP_ACME_EMAIL 'ACME contact email: '
       [[ "$ACME_EMAIL" == *@*.* ]] || die 'Valid ACME contact email is required.'
       ;;
-    2)
+    2|domain)
       INGRESS=domain
-      read -r -p "$(t domain_prompt): " host
+      ni_prompt host RHMCP_PUBLIC_HOST "$(t domain_prompt): "
       host="${host,,}"; host="${host%.}"
       valid_hostname "$host" || die 'Invalid hostname / 域名格式无效'
       PUBLIC_HOST="$host"
       read_https_ports
       printf '  1. Cloudflare DNS only\n  2. Cloudflare Proxied (Full strict)\n  3. Other DNS provider / plain DNS\n'
-      read -r -p 'DNS mode [1-3]: ' mode
+      ni_prompt mode RHMCP_DOMAIN_DNS_MODE 'DNS mode [1-3]: ' '1 cloudflare-dns-only 2 cloudflare-proxied 3 other'
       case "$mode" in
-        1)
+        1|cloudflare-dns-only)
           DOMAIN_DNS_MODE=cloudflare-dns-only
           printf '  1. Auto: HTTP-01 first, DNS-01 fallback\n  2. DNS-01 only (no public port 80 required)\n'
-          read -r -p 'Certificate challenge [1-2, default 1]: ' challenge
-          case "${challenge:-1}" in 1) DOMAIN_CHALLENGE_MODE=auto ;; 2) DOMAIN_CHALLENGE_MODE=dns-01 ;; *) die 'Invalid certificate challenge mode.' ;; esac
+          ni_prompt_default challenge RHMCP_DOMAIN_CHALLENGE_MODE 'Certificate challenge [1-2, default 1]: ' '1'
+          case "$challenge" in 1|auto) DOMAIN_CHALLENGE_MODE=auto ;; 2|dns-01) DOMAIN_CHALLENGE_MODE=dns-01 ;; *) die 'Invalid certificate challenge mode.' ;; esac
           ;;
-        2)
+        2|cloudflare-proxied)
           DOMAIN_DNS_MODE=cloudflare-proxied
           DOMAIN_CHALLENGE_MODE=dns-01
           info 'Cloudflare Proxied mode uses DNS-01; public port 80 is not required for certificate validation.'
           ;;
-        3)
+        3|other)
           DOMAIN_DNS_MODE=other
           DOMAIN_CHALLENGE_MODE=auto
           ;;
         *) die 'Invalid DNS mode.' ;;
       esac
-      read -r -p 'ACME contact email: ' ACME_EMAIL
+      ni_prompt ACME_EMAIL RHMCP_ACME_EMAIL 'ACME contact email: '
       [[ "$ACME_EMAIL" == *@*.* ]] || die 'Valid ACME contact email is required.'
       ;;
-    3)
+    3|cloudflare-tunnel)
       INGRESS=cloudflare-tunnel
-      read -r -p "$(t domain_prompt): " host
+      ni_prompt host RHMCP_PUBLIC_HOST "$(t domain_prompt): "
       host="${host,,}"; host="${host%.}"
       valid_hostname "$host" || die 'Invalid hostname / 域名格式无效'
       PUBLIC_HOST="$host"; PUBLIC_HTTPS_PORT=443; HTTPS_LISTEN_PORT=443
       ;;
-    4)
+    4|private)
       INGRESS=private
       PUBLIC_HOST=mcp.invalid; PUBLIC_HTTPS_PORT=443; HTTPS_LISTEN_PORT=443
       ;;
@@ -312,11 +307,11 @@ RHMCP_PATH_KEY=${PATH_KEY}
 RHMCP_PUBLIC_HOST=${PUBLIC_HOST}
 RHMCP_BIND_HOST=127.0.0.1
 RHMCP_PORT=${LOCAL_PORT}
-RHMCP_ALLOWED_ROOTS=${roots}
+RHMCP_ALLOWED_ROOTS=${RHMCP_ALLOWED_ROOTS:-$roots}
 RHMCP_STATE_DIR=${STATE_DIR}
 RHMCP_DEFAULT_TIMEOUT_MS=30000
 RHMCP_MAX_TIMEOUT_MS=90000
-RHMCP_JSON_RESPONSE=true
+RHMCP_JSON_RESPONSE=${RHMCP_JSON_RESPONSE:-true}
 RHMCP_STATELESS_HTTP=true
 RHMCP_TASKS_EXTENSION=true
 RHMCP_BUILD_COMMIT=${RESOLVED_COMMIT}
@@ -337,7 +332,25 @@ RHMCP_OAUTH_SCOPES=${OAUTH_SCOPES}
 RHMCP_OAUTH_ALGORITHMS=RS256
 EOF2
   fi
+  write_hub_runtime_env "$env_file"
   chmod 600 "$env_file"
+}
+
+# The CF-MCP-HUB agent block is a fixed runtime contract owned by the Hub side
+# (see src/remote_host_mcp/hub_settings.py). The installer never interprets these
+# values: whatever the caller exported is passed through verbatim so the runtime
+# and the sidecar reporting agent can read them from rhmcp.env.
+write_hub_runtime_env() {
+  local env_file="$1" name value
+  while IFS= read -r name; do
+    [[ "$name" == RHMCP_HUB_* ]] || continue
+    value="${!name:-}"
+    [[ -n "$value" ]] || continue
+    if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+      die "Refusing multi-line value for ${name} / 拒绝写入包含换行的 ${name}"
+    fi
+    printf '%s=%s\n' "$name" "$value" >> "$env_file"
+  done < <(compgen -A variable RHMCP_HUB_ 2>/dev/null || true)
 }
 
 load_resume_env() {
@@ -412,6 +425,8 @@ configure_cloudflare_dns_secret() {
   if [[ -r "$token_file" ]]; then return 0; fi
   if [[ -n "${RHMCP_CF_DNS_TOKEN_SOURCE:-}" && -r "$RHMCP_CF_DNS_TOKEN_SOURCE" ]]; then
     token="$(tr -d '\r\n' < "$RHMCP_CF_DNS_TOKEN_SOURCE")"
+  elif [[ -n "${RHMCP_CF_DNS_TOKEN:-}" ]]; then
+    token="$RHMCP_CF_DNS_TOKEN"
   else
     printf 'Cloudflare DNS API token (Zone DNS Edit + Zone Read, target zone only): '
     read -r -s token; printf '\n'
@@ -438,10 +453,16 @@ configure_ingress() {
         [[ $rc -eq 0 ]] || die 'Existing Tunnel credential is present but external HTTPS validation failed.'
         PUBLIC_READY=true
       else
-        printf '\n%s\n' "$(t tunnel_paste)"
-        read -r -p '> ' input
-        configure_managed_cloudflare_tunnel "$PUBLIC_HOST" "$input"
-        unset input
+        if [[ -n "${RHMCP_CF_TUNNEL_TOKEN:-}" ]]; then
+          input="$RHMCP_CF_TUNNEL_TOKEN"
+          configure_managed_cloudflare_tunnel "$PUBLIC_HOST" "$input"
+          unset input
+        else
+          printf '\n%s\n' "$(t tunnel_paste)"
+          read -r -p '> ' input
+          configure_managed_cloudflare_tunnel "$PUBLIC_HOST" "$input"
+          unset input
+        fi
       fi
       ;;
     domain)
@@ -531,7 +552,17 @@ handle_existing_transaction() {
   if [[ "$ACTION" == install ]]; then
     warn "Found incomplete install at stage ${LAST_COMPLETED_STAGE:-unknown}."
     printf '  1. Resume\n  2. Diagnose\n  3. Ownership-aware purge of incomplete install\n  0. Exit\n'
-    read -r -p 'Select [0-3]: ' choice
+    if [[ -n "${RHMCP_INCOMPLETE_ACTION:-}" ]]; then
+      case "$RHMCP_INCOMPLETE_ACTION" in
+        1|resume) choice=1 ;;
+        2|diagnose) choice=2 ;;
+        3|purge|uninstall-incomplete) choice=3 ;;
+        0|exit) choice=0 ;;
+        *) die "Invalid RHMCP_INCOMPLETE_ACTION: ${RHMCP_INCOMPLETE_ACTION} (expected resume|diagnose|purge|exit)." ;;
+      esac
+    else
+      read -r -p 'Select [0-3]: ' choice
+    fi
     case "$choice" in 1) ACTION=resume ;; 2) ACTION=diagnose ;; 3) ACTION=uninstall-incomplete ;; *) exit 0 ;; esac
   fi
   case "$ACTION" in
@@ -600,7 +631,14 @@ main() {
 
   if [[ "$RESUME_MODE" != true ]]; then
     choose_authority
-    choose_port 8765; LOCAL_PORT="$CHOSEN_PORT"
+    if [[ -n "${RHMCP_LOCAL_PORT:-}" ]]; then
+      LOCAL_PORT="$RHMCP_LOCAL_PORT"
+      [[ "$LOCAL_PORT" =~ ^[0-9]+$ && "$LOCAL_PORT" -ge 1024 && "$LOCAL_PORT" -le 65535 ]] || die "Invalid RHMCP_LOCAL_PORT: ${LOCAL_PORT}"
+      port_free "$LOCAL_PORT" || die "RHMCP_LOCAL_PORT is not available on 127.0.0.1: ${LOCAL_PORT}"
+      ok "$(t port_ok): $LOCAL_PORT"
+    else
+      choose_port 8765; LOCAL_PORT="$CHOSEN_PORT"
+    fi
     choose_ingress
     preflight_profile_resources
     choose_auth

@@ -77,7 +77,7 @@ choose_port() {
         return 0
         ;;
       2)
-        read -r -p 'Port / 端口: ' custom
+        ni_prompt custom RHMCP_LOCAL_PORT 'Port / 端口: '
         if port_free "$custom"; then CHOSEN_PORT="$custom"; export CHOSEN_PORT; ok "Port / 端口: $CHOSEN_PORT"; return 0; fi
         warn "Port unavailable / 端口不可用: $custom"
         ;;

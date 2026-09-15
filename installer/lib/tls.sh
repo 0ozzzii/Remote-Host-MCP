@@ -49,7 +49,7 @@ install_nginx_dependency() {
 }
 
 ensure_nginx_for_direct() {
-  local proxy answer installed=false
+  local proxy installed=false
   proxy="$(detect_proxy)"
   case "$proxy" in
     nginx) record_resource host_nginx "$(command -v nginx)" shared; return 0 ;;
@@ -64,12 +64,10 @@ ensure_nginx_for_direct() {
   fi
 
   if ! command -v nginx >/dev/null 2>&1; then
-    if [[ "${RHMCP_AUTO_INSTALL_DEPS:-0}" == 1 ]]; then
+    if [[ "${RHMCP_AUTO_INSTALL_DEPS:-0}" == 1 ]] || confirm 'Nginx is required for managed HTTPS. Install it now?'; then
       install_nginx_dependency
     else
-      read -r -p 'Nginx is required for managed HTTPS. Install it now? [y/N]: ' answer || true
-      [[ "$answer" =~ ^[Yy]$ ]] || die 'Nginx is required for managed direct HTTPS.'
-      install_nginx_dependency
+      die 'Nginx is required for managed direct HTTPS.'
     fi
     installed=true
   fi

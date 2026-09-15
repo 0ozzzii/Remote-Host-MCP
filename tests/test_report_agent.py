@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import urllib.error
 from pathlib import Path
 
 import pytest
 
+from remote_host_mcp.audit import AuditEvent, AuditWriter
 from remote_host_mcp.hub_settings import HubSettings
 from remote_host_mcp.report_agent import (
     HubClient,
@@ -237,6 +239,184 @@ def test_cursor_survives_a_restart(tmp_path: Path) -> None:
     first = list(tail.read_new())
     tail.commit(first[-1][0])
     assert AuditTail(log, cursor).offset == first[-1][0]
+
+
+# ------------------------------------------------------------------- rotation
+
+
+def _rotate(log: Path) -> None:
+    """Do what AuditWriter does: shift the generations and start a new file."""
+    generations = sorted(
+        (p for p in log.parent.iterdir() if p.name.startswith(log.name + ".")),
+        key=lambda p: int(p.name.rsplit(".", 1)[1]),
+        reverse=True,
+    )
+    for path in generations:
+        os.replace(path, log.with_name(f"{log.name}.{int(path.name.rsplit('.', 1)[1]) + 1}"))
+    os.replace(log, log.with_name(f"{log.name}.1"))
+
+
+def test_tail_restarts_from_zero_when_the_file_is_truncated(tmp_path: Path) -> None:
+    log = tmp_path / "calls.jsonl"
+    cursor = tmp_path / "report.cursor"
+    _write_log(log, [_event(toolName="a"), _event(toolName="b")])
+    tail = AuditTail(log, cursor)
+    list(tail.read_new())
+
+    log.write_text("", encoding="utf-8")  # same inode, smaller size
+    _write_log(log, [_event(toolName="fresh")])
+    assert [event["toolName"] for _, event in tail.read_new()] == ["fresh"]
+
+
+def test_tail_reads_unreported_records_out_of_the_rotated_file(tmp_path: Path) -> None:
+    """The rotation must not cost the records written just before it."""
+    log = tmp_path / "calls.jsonl"
+    cursor = tmp_path / "report.cursor"
+    _write_log(log, [_event(toolName="a"), _event(toolName="b"), _event(toolName="c")])
+    tail = AuditTail(log, cursor)
+    first = list(tail.read_new())
+    tail.commit(first[0][0])  # only "a" is acknowledged
+
+    _rotate(log)
+    _write_log(log, [_event(toolName="d")])
+
+    assert [event["toolName"] for _, event in tail.read_new()] == ["b", "c", "d"]
+
+
+def test_tail_does_not_replay_acknowledged_rotated_records(tmp_path: Path) -> None:
+    """The catch-up starts at the checkpoint, so it cannot re-read history."""
+    log = tmp_path / "calls.jsonl"
+    cursor = tmp_path / "report.cursor"
+    _write_log(log, [_event(toolName="a"), _event(toolName="b")])
+    tail = AuditTail(log, cursor)
+    first = list(tail.read_new())
+    tail.commit(first[-1][0])  # everything acknowledged
+
+    _rotate(log)
+    _write_log(log, [_event(toolName="c")])
+
+    assert [event["toolName"] for _, event in tail.read_new()] == ["c"]
+    assert list(tail.read_new()) == []
+
+
+def test_tail_walks_every_generation_missed_while_it_was_away(tmp_path: Path) -> None:
+    log = tmp_path / "calls.jsonl"
+    cursor = tmp_path / "report.cursor"
+    _write_log(log, [_event(toolName="a")])
+    tail = AuditTail(log, cursor)
+    list(tail.read_new())  # consumed but never acknowledged
+
+    _rotate(log)  # .1 = [a]
+    _write_log(log, [_event(toolName="b")])
+    _rotate(log)  # .2 = [a], .1 = [b]
+    _write_log(log, [_event(toolName="c")])
+
+    assert [event["toolName"] for _, event in tail.read_new()] == ["a", "b", "c"]
+    assert list(tail.read_new()) == []
+
+
+def test_tail_resumes_the_rotation_catch_up_after_a_restart(tmp_path: Path) -> None:
+    log = tmp_path / "calls.jsonl"
+    cursor = tmp_path / "report.cursor"
+    _write_log(log, [_event(toolName="a"), _event(toolName="b")])
+    tail = AuditTail(log, cursor)
+    list(tail.read_new())
+    tail.commit(0)  # nothing acknowledged, but the file identity is persisted
+
+    _rotate(log)
+    _write_log(log, [_event(toolName="c")])
+
+    assert [event["toolName"] for _, event in AuditTail(log, cursor).read_new()] == [
+        "a",
+        "b",
+        "c",
+    ]
+
+
+def test_tail_resumes_an_interrupted_catch_up_instead_of_restarting(tmp_path: Path) -> None:
+    """The pending ceiling abandons the generator mid-drain; that must be safe."""
+    log = tmp_path / "calls.jsonl"
+    cursor = tmp_path / "report.cursor"
+    _write_log(log, [_event(toolName="a"), _event(toolName="b")])
+    tail = AuditTail(log, cursor)
+    list(tail.read_new())
+
+    _rotate(log)
+    _write_log(log, [_event(toolName="c"), _event(toolName="d")])
+
+    stream = tail.read_new()
+    offset, first = next(stream)
+    stream.close()  # the consumer gave up after one record
+    assert first["toolName"] == "a"
+
+    assert [event["toolName"] for _, event in tail.read_new()] == ["b", "c", "d"]
+
+
+def test_legacy_cursor_without_file_identity_replays_the_generations(tmp_path: Path) -> None:
+    """An upgrade from a cursor written before file identity was recorded."""
+    log = tmp_path / "calls.jsonl"
+    cursor = tmp_path / "report.cursor"
+    _write_log(log, [_event(toolName="a"), _event(toolName="b")])
+    _rotate(log)
+    _write_log(log, [_event(toolName="c")])
+    cursor.write_text(json.dumps({"offset": 0}), encoding="utf-8")
+
+    assert [event["toolName"] for _, event in AuditTail(log, cursor).read_new()] == [
+        "a",
+        "b",
+        "c",
+    ]
+
+
+def test_tail_notices_a_rotation_that_happens_during_the_catch_up(tmp_path: Path) -> None:
+    """The generations shift under the reader mid-drain; nothing may be skipped."""
+    log = tmp_path / "calls.jsonl"
+    cursor = tmp_path / "report.cursor"
+    _write_log(log, [_event(toolName="a")])
+    tail = AuditTail(log, cursor)
+    list(tail.read_new())
+
+    _rotate(log)  # .1 = [a]
+    _write_log(log, [_event(toolName="b")])
+
+    stream = tail.read_new()
+    assert next(stream)[1]["toolName"] == "a"
+    stream.close()
+
+    _rotate(log)  # .2 = [a], .1 = [b]
+    _write_log(log, [_event(toolName="c")])
+
+    seen: list[str] = []
+    for _ in range(5):
+        seen.extend(event["toolName"] for _, event in tail.read_new())
+    assert seen == ["a", "b", "c"]
+
+
+def test_every_acknowledged_record_survives_real_rotation(tmp_path: Path) -> None:
+    """Drive the real writer past its cap and read it back through the tail."""
+    log = tmp_path / "calls.jsonl"
+    writer = AuditWriter(log, max_bytes=1024, keep_files=3)
+    tail = AuditTail(log, tmp_path / "report.cursor")
+
+    seen: list[str] = []
+    for index in range(30):
+        writer.record(
+            AuditEvent.build(
+                tool_name=f"t{index}",
+                status="ok",
+                started_at="t",
+                duration_ms=1,
+                arguments={"command": "x" * 200},
+            )
+        )
+        for offset, event in tail.read_new():
+            seen.append(event["toolName"])
+            tail.commit(offset)
+    writer.close()
+    seen.extend(event["toolName"] for _, event in tail.read_new())
+
+    assert seen == [f"t{index}" for index in range(30)]
+    assert (tmp_path / "calls.jsonl.1").exists()
 
 
 # ------------------------------------------------------------------------ agent
@@ -490,6 +670,28 @@ def test_rejected_heartbeat_does_not_crash_the_agent(tmp_path: Path) -> None:
     agent.client = HubClient("https://hub.example.com", "agt_bad", opener=always_401)
     assert agent.heartbeat(now=1.0) is False
     assert agent.next_heartbeat > 1.0
+
+
+def test_rotation_does_not_lose_a_batch_that_was_never_acknowledged(tmp_path: Path) -> None:
+    """End to end: the Hub is down, the log rotates, and nothing is skipped."""
+    opener = _RecordingOpener(fail_on={"/agent/v1/report": urllib.error.URLError("down")})
+    agent = _agent(tmp_path, opener, report_batch_size=1)
+    log = agent.tail.log_path
+    _write_log(log, [_event(toolName="unacked")])
+
+    agent.cycle(now=1.0)
+    assert agent.pending_count == 1
+    assert agent.tail.offset == 0  # nothing acknowledged, so nothing committed
+
+    _rotate(log)
+    _write_log(log, [_event(toolName="after")])
+
+    opener.fail_on.clear()
+    agent.cycle(now=100_000.0)
+
+    sent = {event["toolName"] for _, _, body in _reports(opener) for event in body["events"]}
+    assert {"unacked", "after"} <= sent
+    assert agent.pending_count == 0
 
 
 def test_run_pulls_config_before_the_first_cycle(tmp_path: Path) -> None:

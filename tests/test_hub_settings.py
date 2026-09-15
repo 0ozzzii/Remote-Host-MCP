@@ -93,3 +93,26 @@ def test_relative_audit_log_path_is_rejected_in_strict_mode(monkeypatch: pytest.
     monkeypatch.setenv("RHMCP_HUB_AUDIT_LOG_PATH", "relative/audit.jsonl")
     with pytest.raises(HubConfigError):
         HubSettings.from_env(strict=True)
+
+
+def test_audit_rotation_defaults_bound_the_log(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear(monkeypatch)
+    hub = HubSettings.from_env()
+    assert hub.audit_max_bytes == 32 * 1024 * 1024
+    assert hub.audit_keep_files == 3
+
+
+def test_audit_rotation_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear(monkeypatch)
+    monkeypatch.setenv("RHMCP_HUB_AUDIT_MAX_BYTES", "1048576")
+    monkeypatch.setenv("RHMCP_HUB_AUDIT_KEEP_FILES", "5")
+    hub = HubSettings.from_env(strict=True)
+    assert hub.audit_max_bytes == 1048576
+    assert hub.audit_keep_files == 5
+
+
+def test_audit_rotation_rejects_a_zero_byte_cap_in_strict_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear(monkeypatch)
+    monkeypatch.setenv("RHMCP_HUB_AUDIT_MAX_BYTES", "0")
+    with pytest.raises(HubConfigError):
+        HubSettings.from_env(strict=True)

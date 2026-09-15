@@ -50,6 +50,8 @@ POLL_SECONDS = 1.0
 READ_CHUNK_BYTES = 4 * 1024 * 1024
 # Backpressure ceiling: stop reading new lines past this many un-acked events.
 MAX_PENDING_EVENTS = 5000
+# Guard against a hand-mangled log directory while scanning for rotated files.
+_MAX_ROTATED_FILES = 64
 
 # Fields dropped per report level. `meta` keeps only counters and identity.
 _OUTPUT_FIELDS = ("outputBytes", "outputPreview", "outputRef")
@@ -169,8 +171,26 @@ def prepare_event(
     return redact_event(payload, enabled=redact_enabled)
 
 
+def _parse_line(line: bytes) -> dict[str, Any] | None:
+    try:
+        event = json.loads(line.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        logger.warning("skipping malformed audit line")
+        return None
+    return event if isinstance(event, dict) else None
+
+
 class AuditTail:
-    """Byte-offset reader over the audit JSONL with an on-disk checkpoint."""
+    """Byte-offset reader over the audit JSONL with an on-disk checkpoint.
+
+    The writer rotates ``calls.jsonl`` to ``calls.jsonl.1`` (and ``.1`` to
+    ``.2``, ...) once it passes its size cap, so the main file can be replaced
+    under the reader at any time. When that is detected the reader drains the
+    rotated files first — oldest generation first — and only then restarts the
+    main file from byte 0. Records written just before a rotation are therefore
+    still reported; the ones that get reported twice are harmless because the
+    Hub dedupes on the event ``id``.
+    """
 
     def __init__(self, log_path: Path, cursor_path: Path) -> None:
         self.log_path = Path(log_path)
@@ -178,41 +198,198 @@ class AuditTail:
         # `offset` is the acknowledged checkpoint; `read_offset` is how far this
         # process has consumed. Keeping them apart is what lets a failed batch be
         # retried without re-reading (and re-queueing) the same lines.
-        self.offset = self._load_offset()
+        # `_inode` identifies the main file the checkpoint was taken in, which is
+        # what makes rotation detectable after a restart.
+        self.offset, self._inode = self._load_cursor()
         self.read_offset = self.offset
+        # Catch-up plan while rotated files are being drained: a list of
+        # ``[path, resume_offset, inode]`` entries, oldest generation first.
+        # ``None`` means "not catching up".
+        self._drain_plan: list[list[Any]] | None = None
 
-    def _load_offset(self) -> int:
+    def _load_cursor(self) -> tuple[int, int | None]:
         try:
             data = json.loads(self.cursor_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return 0
-        offset = data.get("offset") if isinstance(data, dict) else None
-        return offset if isinstance(offset, int) and offset >= 0 else 0
+            return 0, None
+        if not isinstance(data, dict):
+            return 0, None
+        offset = data.get("offset")
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            return 0, None
+        inode = data.get("inode")
+        return offset, inode if isinstance(inode, int) and inode else None
 
     def commit(self, offset: int) -> None:
         """Persist the acknowledged offset atomically."""
         self.offset = offset
         self.cursor_path.parent.mkdir(parents=True, exist_ok=True)
         temp = self.cursor_path.with_suffix(self.cursor_path.suffix + ".tmp")
-        temp.write_text(json.dumps({"offset": offset}), encoding="utf-8")
+        temp.write_text(json.dumps({"offset": offset, "inode": self._inode}), encoding="utf-8")
         os.replace(temp, self.cursor_path)
 
-    def read_new(self) -> Iterator[tuple[int, dict[str, Any]]]:
-        """Yield ``(offset_after_line, event)`` pairs for lines not yet read.
+    # -------------------------------------------------------------- rotation
 
-        A trailing partial line is left for the next read; a log that shrank
-        (rotated or truncated) restarts from the beginning.
+    def _rotated_path(self, index: int) -> Path:
+        return self.log_path.with_name(f"{self.log_path.name}.{index}")
+
+    def _rotated_files(self) -> list[tuple[int, Path]]:
+        """Rotated siblings as ``(generation, path)``, newest generation first.
+
+        The writer keeps the generations contiguous (``.1``..``.N``), so the
+        first gap ends the scan; the cap only guards a hand-mangled directory.
         """
-        try:
-            size = self.log_path.stat().st_size
-        except OSError:
-            return
+        found: list[tuple[int, Path]] = []
+        for index in range(1, _MAX_ROTATED_FILES + 1):
+            candidate = self._rotated_path(index)
+            if not candidate.exists():
+                break
+            found.append((index, candidate))
+        return found
+
+    def _checkpoint_index(self, rotated: Sequence[tuple[int, Path]]) -> int | None:
+        """Generation holding the checkpoint, identified by file identity.
+
+        Returns ``None`` when the identity is unknown (filesystem without a
+        usable inode) or the checkpoint's file has already been pruned.
+        """
+        if self._inode is None:
+            return None
+        for index, path in rotated:
+            info = self._stat(path)
+            if info is not None and info[1] == self._inode:
+                return index
+        return None
+
+    def _start_drain(self) -> None:
+        """Plan the catch-up read over the rotated files.
+
+        The criterion that keeps this from re-reading history forever is file
+        identity, not guesswork:
+
+        * the checkpoint's own generation (found by inode) is read from
+          ``offset`` — exactly the un-acknowledged tail of the file that was
+          rotated away;
+        * newer generations (lower index) are read from byte 0, since they were
+          written after the checkpoint;
+        * older generations (higher index) are skipped outright: the checkpoint
+          already sits past them, so they were acknowledged in full.
+
+        A checkpoint of 0 means *nothing* has been acknowledged, and then no
+        generation can be skipped. When the identity is unknown or the
+        checkpoint's file is already gone, every retained generation is replayed
+        once — bounded by the writer's keep count, and de-duplicated by the Hub.
+        """
+        rotated = self._rotated_files()
+        checkpoint = self._checkpoint_index(rotated) if self.offset > 0 else None
+        plan: list[list[Any]] = []
+        # Oldest generation first: the records have to be reported in the order
+        # they were written.
+        for index, path in reversed(rotated):
+            info = self._stat(path)
+            inode = info[1] if info is not None else None
+            if checkpoint is None or index < checkpoint:
+                plan.append([path, 0, inode])
+            elif index == checkpoint:
+                plan.append([path, self.offset, inode])
+            # index > checkpoint: entirely acknowledged before the checkpoint
+            # advanced past it, so it needs no replay.
+        self._drain_plan = plan
+        # The cursor now measures the *new* main file; nothing has been acked in
+        # it yet. Remembering its identity here is what lets a rotation that
+        # happens *during* the catch-up be noticed afterwards.
+        self.offset = 0
+        self.read_offset = 0
+        info = self._stat(self.log_path)
+        self._inode = info[1] if info is not None else None
+
+    def _was_rotated(self, size: int, inode: int | None) -> bool:
         if size < self.read_offset:
-            logger.warning("audit log shrank below the read cursor; restarting from 0")
-            self.offset = 0
-            self.read_offset = 0
-        if size == self.read_offset:
-            return
+            return True
+        if self._inode is None:
+            # File identity is unknown — a cursor written before it was recorded,
+            # or one saved mid-catch-up. The offset then cannot be trusted: it
+            # may belong to a file that has already been rotated away, which
+            # would point it into the middle of the new main file. Replaying the
+            # retained generations once is cheap next to silently skipping them.
+            return bool(self._rotated_files())
+        return inode is not None and inode != self._inode
+
+    @staticmethod
+    def _stat(path: Path) -> tuple[int, int | None] | None:
+        try:
+            info = path.stat()
+        except OSError:
+            return None
+        return info.st_size, (info.st_ino or None)
+
+    def _read_chunk(self, path: Path, start: int, limit: int) -> bytes | None:
+        try:
+            with path.open("rb") as handle:
+                handle.seek(start)
+                return handle.read(min(READ_CHUNK_BYTES, limit - start))
+        except OSError as exc:
+            logger.warning("cannot read audit log %s: %s", path.name, type(exc).__name__)
+            return None
+
+    def _drain_step(self) -> Iterator[tuple[int, dict[str, Any]]]:
+        """Read the pending generations, oldest first.
+
+        Bounded on purpose: one call consumes at most ``READ_CHUNK_BYTES`` of
+        file content so a catch-up cannot flood the pending queue, and the plan
+        remembers where it stopped, so an interrupted drain resumes there rather
+        than restarting (and re-sending) from the beginning.
+        """
+        budget = READ_CHUNK_BYTES
+        plan = self._drain_plan
+        while plan and budget > 0:
+            entry = plan[0]
+            path, start, expected = entry[0], entry[1], entry[2]
+            info = self._stat(path)
+            if info is None or info[0] <= start:
+                plan.pop(0)
+                continue
+            if expected is not None and info[1] is not None and info[1] != expected:
+                # A rotation moved the generations under us: the plan now points
+                # at the wrong file. Rebuilding replays some records, which the
+                # Hub dedupes; reading on would skip them.
+                logger.warning("rotated audit generations shifted; rebuilding the catch-up plan")
+                self._start_drain()
+                return
+            end = info[0]
+            chunk = self._read_chunk(path, start, min(end, start + budget))
+            if chunk is None:
+                plan.pop(0)
+                continue
+            budget -= len(chunk)
+            final = start + len(chunk) >= end
+            lines = chunk.split(b"\n")
+            tail = lines.pop()
+            if final and tail.strip():
+                # The generation will never grow, so a non-empty tail is a line
+                # cut off by a crash; try it rather than dropping the record.
+                lines.append(tail)
+            position = start
+            for line in lines:
+                position += len(line) + 1
+                if not line.strip():
+                    continue
+                event = _parse_line(line)
+                if event is not None:
+                    entry[1] = position
+                    # 0 is a sentinel: the record does not live in the current
+                    # main file, so it must not advance that file's checkpoint.
+                    yield 0, event
+            if final:
+                plan.pop(0)
+            else:
+                entry[1] = position
+        if self._drain_plan is not None and not self._drain_plan:
+            self._drain_plan = None
+
+    # ------------------------------------------------------------------ read
+
+    def _read_main(self) -> Iterator[tuple[int, dict[str, Any]]]:
         try:
             with self.log_path.open("rb") as handle:
                 handle.seek(self.read_offset)
@@ -230,13 +407,41 @@ class AuditTail:
             self.read_offset += len(line) + 1
             if not line.strip():
                 continue
-            try:
-                event = json.loads(line.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                logger.warning("skipping malformed audit line")
-                continue
-            if isinstance(event, dict):
+            event = _parse_line(line)
+            if event is not None:
                 yield self.read_offset, event
+
+    def read_new(self) -> Iterator[tuple[int, dict[str, Any]]]:
+        """Yield ``(offset_after_line, event)`` pairs for lines not yet read.
+
+        A trailing partial line is left for the next read. A main file that
+        shrank or was replaced is drained from the rotated generations first,
+        so a rotation never costs a record.
+        """
+        if self._drain_plan is not None:
+            yield from self._drain_step()
+            if self._drain_plan is not None:
+                # Finish catching up before touching the new main file, otherwise
+                # its records could be acknowledged ahead of older ones.
+                return
+        info = self._stat(self.log_path)
+        if info is None:
+            return
+        size, inode = info
+        if self._was_rotated(size, inode):
+            logger.warning("audit log shrank or was replaced; draining rotated files first")
+            self._start_drain()
+            yield from self._drain_step()
+            if self._drain_plan is not None:
+                return
+            info = self._stat(self.log_path)
+            if info is None:
+                return
+            size, inode = info
+        self._inode = inode
+        if size <= self.read_offset:
+            return
+        yield from self._read_main()
 
 
 class ReportAgent:

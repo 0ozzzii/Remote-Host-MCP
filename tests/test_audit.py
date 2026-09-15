@@ -222,3 +222,38 @@ async def test_middleware_failure_never_breaks_the_tool_call(tmp_path: Path) -> 
 
     result = await middleware(_FakeContext({"name": "exec", "arguments": {}}), call_next)
     assert getattr(result, "content")[0].text == "still works"
+
+
+async def test_audit_records_the_caller_when_wired_in_host_server_order(tmp_path: Path) -> None:
+    """The whole point of P1+P2 together: the audit line carries the real caller.
+
+    host_server appends ClientContextMiddleware first, which makes it the
+    outermost of the two, so the identity is bound before the audit middleware
+    runs. This pins that ordering.
+    """
+    from remote_host_mcp.client_context import ClientContextMiddleware
+
+    path = tmp_path / "calls.jsonl"
+    writer = AuditWriter(path)
+    audit = AuditMiddleware(writer)
+    context = ClientContextMiddleware()
+
+    class _Request:
+        headers = {"CF-Connecting-IP": "203.0.113.7", "CF-IPCountry": "CN", "User-Agent": "ChatGPT/1.0"}
+        client = type("Peer", (), {"host": "127.0.0.1"})()
+
+    ctx = _FakeContext({"name": "exec", "arguments": {"command": "ls"}})
+    ctx.request = _Request()
+
+    async def tool(_ctx: object) -> object:
+        return _FakeResult("done", structured={"exit_code": 0})
+
+    await context(ctx, lambda c: audit(c, tool))
+    writer.close()
+
+    line = _read_lines(path)[0]
+    assert line["clientIp"] == "203.0.113.7"
+    assert line["clientCountry"] == "CN"
+    assert line["clientUa"] == "ChatGPT/1.0"
+    assert line["clientCity"] is None
+    assert line["toolName"] == "exec"

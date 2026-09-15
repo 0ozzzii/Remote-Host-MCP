@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
 from . import __version__
-from .hub_settings import HubConfigError, HubSettings
+from .hub_settings import OUTPUT_MODES, REPORT_LEVELS, HubConfigError, HubSettings
 from .redact import redact_event
 
 logger = logging.getLogger("remote_host_mcp.report")
@@ -259,10 +259,13 @@ class ReportAgent:
         self.backoff = 0.0
         self.next_attempt = 0.0
         self.last_flush = 0.0
+        self.next_heartbeat = 0.0
         self.dropped = 0
-        # Effective report level / redaction switch; refreshed by P5 config pull.
+        # Effective settings; local RHMCP_HUB_* values seed them and the Hub
+        # overrides them through /agent/v1/config.
         self.report_level = settings.report_level
         self.redact_enabled = settings.redact_enabled
+        self.output_mode = settings.output_mode
 
     @property
     def pending_count(self) -> int:
@@ -344,9 +347,91 @@ class ReportAgent:
         self.backoff = 0.0
         self.next_attempt = 0.0
 
-    def cycle(self, now: float | None = None) -> bool:
-        """One poll: read new events, then flush while a batch is due."""
+    # ------------------------------------------------------- heartbeat / config
+
+    def heartbeat(self, now: float | None = None) -> bool:
+        """POST the version and pick up any pending configuration change.
+
+        ``configChanged`` is how the Hub propagates a key revocation: the Hub only
+        owns its own database, so a revoked key keeps working until the host
+        comes back and reads the new configuration. The gap is one heartbeat.
+        """
         moment = time.monotonic() if now is None else now
+        self.next_heartbeat = moment + self.settings.heartbeat_seconds
+        try:
+            body = self.client.heartbeat()
+        except HubUnavailable as exc:
+            logger.warning("heartbeat failed: %s", exc)
+            return False
+        except HubRejected as exc:
+            logger.error("heartbeat rejected, check RHMCP_HUB_AGENT_KEY: %s", exc)
+            return False
+        if body.get("configChanged"):
+            logger.info("Hub reports configChanged; pulling the new configuration")
+            self.pull_config()
+        return True
+
+    def pull_config(self) -> bool:
+        """GET /agent/v1/config and apply it."""
+        try:
+            body = self.client.fetch_config()
+        except (HubUnavailable, HubRejected) as exc:
+            logger.warning("could not fetch configuration: %s", exc)
+            return False
+        self.apply_config(body)
+        return True
+
+    def apply_config(self, config: Mapping[str, Any]) -> list[str]:
+        """Apply Hub-pushed settings. Unknown or invalid values are ignored.
+
+        Only fields the Hub actually sends are touched, so a partial payload
+        cannot silently reset the others.
+        """
+        changes: list[str] = []
+
+        level = config.get("reportLevel")
+        if isinstance(level, str):
+            normalised = level.strip().lower()
+            if normalised in REPORT_LEVELS and normalised != self.report_level:
+                changes.append(f"reportLevel {self.report_level} -> {normalised}")
+                self.report_level = normalised
+
+        redact = config.get("redactEnabled")
+        if isinstance(redact, bool) and redact != self.redact_enabled:
+            # Turning redaction off means credentials in command text and output
+            # leave this host in the clear; make that unmistakable in the log.
+            logger.warning(
+                "Hub set redactEnabled=%s: %s",
+                redact,
+                "secrets will be reported verbatim" if not redact else "secrets are redacted again",
+            )
+            changes.append(f"redactEnabled {self.redact_enabled} -> {redact}")
+            self.redact_enabled = redact
+
+        mode = config.get("outputMode")
+        if isinstance(mode, str):
+            normalised_mode = mode.strip().lower()
+            if normalised_mode in OUTPUT_MODES and normalised_mode != self.output_mode:
+                changes.append(f"outputMode {self.output_mode} -> {normalised_mode}")
+                self.output_mode = normalised_mode
+
+        host_id = config.get("hostId")
+        if isinstance(host_id, str) and host_id and host_id != self.settings.host_id:
+            logger.warning(
+                "Hub identifies this host as %s but RHMCP_HUB_HOST_ID is %s",
+                host_id,
+                self.settings.host_id,
+            )
+
+        if changes:
+            logger.info("applied Hub configuration: %s", "; ".join(changes))
+        return changes
+
+    def cycle(self, now: float | None = None) -> bool:
+        """One poll: heartbeat if due, read new events, then flush due batches."""
+        moment = time.monotonic() if now is None else now
+        if moment >= self.next_heartbeat:
+            self.heartbeat(moment)
         if moment >= self.next_attempt:
             self._read_more()
             if self._should_flush(moment):
@@ -358,14 +443,18 @@ class ReportAgent:
 
     def run(self) -> None:
         logger.info(
-            "reporting to %s as host %s (level=%s redact=%s batch=%d/%ds)",
+            "reporting to %s as host %s (level=%s redact=%s batch=%d/%ds heartbeat=%ds)",
             self.settings.base_url,
             self.settings.host_id,
             self.report_level,
             self.redact_enabled,
             self.settings.report_batch_size,
             self.settings.report_interval_seconds,
+            self.settings.heartbeat_seconds,
         )
+        # Adopt whatever the Hub currently has rather than trusting a possibly
+        # stale rhmcp.env on disk.
+        self.pull_config()
         while True:
             try:
                 self.cycle()
@@ -410,6 +499,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit("reporting is disabled (RHMCP_HUB_REPORT_ENABLED=false)")
     if args.once:
         agent.cycle()
+        logger.info(
+            "one-shot cycle done: pending=%d dropped=%d level=%s redact=%s",
+            agent.pending_count,
+            agent.dropped,
+            agent.report_level,
+            agent.redact_enabled,
+        )
         return
     try:
         agent.run()

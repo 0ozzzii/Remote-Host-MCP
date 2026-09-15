@@ -101,6 +101,82 @@ def test_writer_never_raises_on_unwritable_path(tmp_path: Path) -> None:
     writer.close()
 
 
+# ------------------------------------------------------------------ rotation
+
+
+def _filler(tool_name: str, *, size: int = 200) -> AuditEvent:
+    return AuditEvent.build(
+        tool_name=tool_name,
+        status="ok",
+        started_at="t",
+        duration_ms=1,
+        arguments={"command": "x" * size},
+    )
+
+
+def test_writer_rotates_once_the_size_cap_is_reached(tmp_path: Path) -> None:
+    path = tmp_path / "calls.jsonl"
+    writer = AuditWriter(path, max_bytes=1024, keep_files=3)
+    for _ in range(20):
+        assert writer.record(_filler("exec")) is True
+    writer.close()
+
+    assert (tmp_path / "calls.jsonl.1").exists()
+    # The whole point: no single file may grow past the cap.
+    assert path.stat().st_size <= 1024
+    assert (tmp_path / "calls.jsonl.1").stat().st_size <= 1024
+
+
+def test_writer_keeps_at_most_n_generations(tmp_path: Path) -> None:
+    path = tmp_path / "calls.jsonl"
+    writer = AuditWriter(path, max_bytes=512, keep_files=2)
+    for _ in range(50):
+        writer.record(_filler("exec"))
+    writer.close()
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "calls.jsonl",
+        "calls.jsonl.1",
+        "calls.jsonl.2",
+    ]
+
+
+def test_writer_appends_to_the_new_file_after_rotation(tmp_path: Path) -> None:
+    path = tmp_path / "calls.jsonl"
+    writer = AuditWriter(path, max_bytes=512, keep_files=3)
+    for _ in range(10):
+        writer.record(_filler("old"))
+    assert (tmp_path / "calls.jsonl.1").exists()
+
+    assert writer.record(_filler("newest")) is True
+    writer.close()
+
+    assert [line["toolName"] for line in _read_lines(path)][-1] == "newest"
+
+
+def test_writer_survives_a_failed_rotation(tmp_path: Path) -> None:
+    # A directory where the first rotated generation belongs: every rename fails.
+    (tmp_path / "calls.jsonl.1").mkdir()
+    path = tmp_path / "calls.jsonl"
+    writer = AuditWriter(path, max_bytes=256, keep_files=1)
+    for _ in range(5):
+        assert writer.record(_filler("exec")) is True
+    writer.close()
+
+    # Rotation is best-effort; the records still land in the log that is open.
+    assert len(_read_lines(path)) == 5
+
+
+def test_writer_rotation_can_be_disabled(tmp_path: Path) -> None:
+    path = tmp_path / "calls.jsonl"
+    writer = AuditWriter(path, max_bytes=None, keep_files=3)
+    for _ in range(20):
+        writer.record(_filler("exec"))
+    writer.close()
+
+    assert [p.name for p in tmp_path.iterdir()] == ["calls.jsonl"]
+
+
 def test_event_truncates_args_and_output_locally() -> None:
     event = AuditEvent.build(
         tool_name="exec",

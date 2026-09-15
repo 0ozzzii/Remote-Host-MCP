@@ -115,7 +115,15 @@ def build_server(settings: Settings) -> MCPServer:
     # serving tool calls.
     hub = HubSettings.from_env(strict=False)
     if hub.audit_enabled:
-        mcp.middleware.append(AuditMiddleware(AuditWriter(hub.resolved_audit_log_path())))
+        mcp.middleware.append(
+            AuditMiddleware(
+                AuditWriter(
+                    hub.resolved_audit_log_path(),
+                    max_bytes=hub.audit_max_bytes,
+                    keep_files=hub.audit_keep_files,
+                )
+            )
+        )
 
     # ------------------------- Durable jobs -------------------------
     @mcp.tool(

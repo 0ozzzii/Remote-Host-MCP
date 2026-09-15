@@ -13,6 +13,12 @@ Records are written **unredacted**; redaction is applied on the reporting path
 so the Hub-pushed ``redactEnabled`` switch stays authoritative and can be
 flipped without regenerating history. The file is created 0600 inside the
 0700 state directory.
+
+The log is bounded: once it passes ``max_bytes`` it is renamed to ``.1`` (and
+``.1`` to ``.2``, ...), keeping the newest ``keep_files`` generations. A
+long-lived host therefore cannot fill its disk, and because the reporter
+resumes from its checkpoint the rotation is invisible to it except for the
+handful of records that are read twice — which the Hub dedupes on event id.
 """
 
 from __future__ import annotations
@@ -38,6 +44,11 @@ PROVIDER = "rhmcp"
 # here keeps a single huge ``cat`` from filling the local log.
 ARGS_TEXT_LIMIT_BYTES = 16 * 1024
 OUTPUT_PREVIEW_LIMIT_BYTES = 4 * 1024
+
+# Rotation defaults. A max-size record is ~20 KiB, so 32 MiB is roughly 1600
+# calls per file; three generations cap the on-disk log at ~128 MiB.
+DEFAULT_AUDIT_MAX_BYTES = 32 * 1024 * 1024
+DEFAULT_AUDIT_KEEP_FILES = 3
 
 _TOOL_CALL_METHOD = "tools/call"
 _ERROR_CODE_MAX = 64
@@ -166,11 +177,27 @@ class _State:
 
 
 class AuditWriter:
-    """Append-only JSONL sink. Never raises into the caller's code path."""
+    """Append-only JSONL sink with size-based rotation. Never raises into the
+    caller's code path.
 
-    def __init__(self, path: Path, *, enabled: bool = True) -> None:
+    Rotation is best-effort and strictly secondary to durability: if the rename
+    fails (a reader holding the file on Windows, a read-only directory) the
+    record is still appended to the file that is already open.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        enabled: bool = True,
+        max_bytes: int | None = DEFAULT_AUDIT_MAX_BYTES,
+        keep_files: int = DEFAULT_AUDIT_KEEP_FILES,
+    ) -> None:
         self.path = Path(path)
         self.enabled = enabled
+        # ``None`` or a non-positive budget disables rotation entirely.
+        self.max_bytes = max_bytes if max_bytes is not None and max_bytes > 0 else None
+        self.keep_files = max(0, keep_files)
         self._state = _State()
         self._open_failed = False
 
@@ -187,6 +214,58 @@ class AuditWriter:
         state.handle = handle
         return handle
 
+    def _rotated_path(self, index: int) -> Path:
+        return self.path.with_name(f"{self.path.name}.{index}")
+
+    def _should_rotate(self, handle: Any, incoming: int) -> bool:
+        if self.max_bytes is None:
+            return False
+        try:
+            size = os.fstat(handle).st_size
+        except OSError:
+            return False
+        # Never rotate an empty file: a single record larger than the budget
+        # would otherwise rotate forever and lose the record it just wrote.
+        return size > 0 and size + incoming > self.max_bytes
+
+    def _rotate_locked(self) -> Any:
+        """Roll the log out of the way and reopen it. Called under the lock."""
+        state = self._state
+        handle, state.handle = state.handle, None
+        if handle is not None:
+            try:
+                os.close(handle)
+            except OSError:
+                pass
+        try:
+            self._rotate_files()
+        except OSError as exc:
+            # The rename did not happen, so the original file is still in place;
+            # reopening below appends to it and the record survives.
+            logger.warning(
+                "audit log rotation failed (%s); continuing in place", type(exc).__name__
+            )
+        return self._handle()
+
+    def _rotate_files(self) -> None:
+        keep = self.keep_files
+        if keep == 0:
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+            return
+        try:
+            self._rotated_path(keep).unlink()
+        except FileNotFoundError:
+            pass
+        for index in range(keep - 1, 0, -1):
+            source = self._rotated_path(index)
+            if source.exists():
+                os.replace(source, self._rotated_path(index + 1))
+        if self.path.exists():
+            os.replace(self.path, self._rotated_path(1))
+
     def record(self, event: AuditEvent) -> bool:
         """Append one event. Returns False when auditing is off or the write failed."""
         if not self.enabled:
@@ -200,6 +279,8 @@ class AuditWriter:
         try:
             with self._state.lock:
                 handle = self._handle()
+                if self._should_rotate(handle, len(payload)):
+                    handle = self._rotate_locked()
                 os.write(handle, payload)
             return True
         except OSError as exc:

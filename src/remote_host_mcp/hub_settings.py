@@ -35,6 +35,11 @@ DEFAULT_REPORT_BATCH_SIZE = 50
 DEFAULT_REPORT_MAX_BATCH = 200
 DEFAULT_HEARTBEAT_SECONDS = 60
 
+# Local audit-log rotation. 32 MiB / 3 generations bounds the log at ~128 MiB
+# no matter how long the host runs.
+DEFAULT_AUDIT_MAX_BYTES = 32 * 1024 * 1024
+DEFAULT_AUDIT_KEEP_FILES = 3
+
 
 class HubConfigError(ValueError):
     pass
@@ -129,6 +134,8 @@ class HubSettings:
     report_enabled: bool = True
     audit_enabled: bool = True
     audit_log_path: Path | None = None
+    audit_max_bytes: int = DEFAULT_AUDIT_MAX_BYTES
+    audit_keep_files: int = DEFAULT_AUDIT_KEEP_FILES
 
     report_interval_seconds: int = DEFAULT_REPORT_INTERVAL_SECONDS
     report_batch_size: int = DEFAULT_REPORT_BATCH_SIZE
@@ -179,6 +186,10 @@ class HubSettings:
             report_enabled=_env_bool("REPORT_ENABLED", True, strict=strict),
             audit_enabled=_env_bool("AUDIT_ENABLED", True, strict=strict),
             audit_log_path=audit_log_path,
+            audit_max_bytes=_env_int(
+                "AUDIT_MAX_BYTES", DEFAULT_AUDIT_MAX_BYTES, 64 * 1024, 4 * 1024 * 1024 * 1024, strict=strict
+            ),
+            audit_keep_files=_env_int("AUDIT_KEEP_FILES", DEFAULT_AUDIT_KEEP_FILES, 0, 100, strict=strict),
             report_interval_seconds=_env_int(
                 "REPORT_INTERVAL_SECONDS", DEFAULT_REPORT_INTERVAL_SECONDS, 1, 3600, strict=strict
             ),

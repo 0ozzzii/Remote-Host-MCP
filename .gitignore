@@ -9,3 +9,8 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .coverage
+
+# Windows artifacts from installer test sandboxes: absolute paths like
+# C:\Users\... get sanitized into repo-relative names starting with "C:"
+# (the colon becomes U+F03A, so match on pytest's tmp-dir stem instead).
+*pytest-of-*

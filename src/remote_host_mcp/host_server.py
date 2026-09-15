@@ -11,8 +11,10 @@ from mcp.types import EmbeddedResource, ImageContent, TextContent, ToolAnnotatio
 from pydantic import Field
 
 from .auth import build_oauth_components
+from .audit import AuditMiddleware, AuditWriter
 from .client_context import ClientContextMiddleware
 from .config import ConfigError, Settings
+from .hub_settings import HubSettings
 from .jobs import (
     cancel_job as cancel_job_impl,
     cleanup_job as cleanup_job_impl,
@@ -107,6 +109,13 @@ def build_server(settings: Settings) -> MCPServer:
     # before any handler runs, so tool dispatch and audit see the real caller
     # rather than the tunnel's loopback peer.
     mcp.middleware.append(ClientContextMiddleware())
+
+    # Structured per-call audit log. Hub settings are read leniently here: a
+    # missing or malformed RHMCP_HUB_* block must never stop the server from
+    # serving tool calls.
+    hub = HubSettings.from_env(strict=False)
+    if hub.audit_enabled:
+        mcp.middleware.append(AuditMiddleware(AuditWriter(hub.resolved_audit_log_path())))
 
     # ------------------------- Durable jobs -------------------------
     @mcp.tool(

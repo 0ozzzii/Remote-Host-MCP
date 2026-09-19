@@ -6,6 +6,7 @@ _uninstall_print() { printf '  %-8s %s\n' "$1" "$2"; }
 cache_uninstall_resources() {
   UNINSTALL_CHECK_CLI="$(resource_value rmcp_cli PATH 2>/dev/null || true)"
   UNINSTALL_CHECK_UNIT="$(resource_value service_unit PATH 2>/dev/null || true)"
+  UNINSTALL_CHECK_REPORT_UNIT="$(resource_value report_service_unit PATH 2>/dev/null || true)"
   UNINSTALL_CHECK_TUNNEL_UNIT="$(resource_value tunnel_service_unit PATH 2>/dev/null || true)"
   UNINSTALL_CHECK_RENEW_SERVICE="$(resource_value cert_renew_service PATH 2>/dev/null || true)"
   UNINSTALL_CHECK_RENEW_TIMER="$(resource_value cert_renew_timer PATH 2>/dev/null || true)"
@@ -14,13 +15,14 @@ cache_uninstall_resources() {
   UNINSTALL_CHECK_NGINX_SITE="$(resource_value nginx_site PATH 2>/dev/null || true)"
   UNINSTALL_CHECK_NGINX_LINK="$(resource_value nginx_site_link PATH 2>/dev/null || true)"
   UNINSTALL_CHECK_PORT="${RHMCP_LOCAL_PORT:-${LOCAL_PORT:-8765}}"
-  export UNINSTALL_CHECK_CLI UNINSTALL_CHECK_UNIT UNINSTALL_CHECK_TUNNEL_UNIT UNINSTALL_CHECK_RENEW_SERVICE UNINSTALL_CHECK_RENEW_TIMER UNINSTALL_CHECK_RENEW_PID UNINSTALL_CHECK_RENEW_LOOP UNINSTALL_CHECK_NGINX_SITE UNINSTALL_CHECK_NGINX_LINK UNINSTALL_CHECK_PORT
+  export UNINSTALL_CHECK_CLI UNINSTALL_CHECK_UNIT UNINSTALL_CHECK_REPORT_UNIT UNINSTALL_CHECK_TUNNEL_UNIT UNINSTALL_CHECK_RENEW_SERVICE UNINSTALL_CHECK_RENEW_TIMER UNINSTALL_CHECK_RENEW_PID UNINSTALL_CHECK_RENEW_LOOP UNINSTALL_CHECK_NGINX_SITE UNINSTALL_CHECK_NGINX_LINK UNINSTALL_CHECK_PORT
 }
 
 uninstall_plan() {
   local purge="${1:-false}" cli unit tunnel_unit renew_service renew_timer renew_pid renew_loop nginx_site nginx_link cert_name
   cli="$(resource_value rmcp_cli PATH 2>/dev/null || true)"
   unit="$(resource_value service_unit PATH 2>/dev/null || true)"
+  report_unit="$(resource_value report_service_unit PATH 2>/dev/null || true)"
   tunnel_unit="$(resource_value tunnel_service_unit PATH 2>/dev/null || true)"
   renew_service="$(resource_value cert_renew_service PATH 2>/dev/null || true)"
   renew_timer="$(resource_value cert_renew_timer PATH 2>/dev/null || true)"
@@ -35,6 +37,7 @@ uninstall_plan() {
   _uninstall_print REMOVE "product runtime: ${RUNTIME_DIR:-unknown}"
   [[ -n "$cli" ]] && _uninstall_print REMOVE "owned rmcp CLI: $cli"
   [[ -n "$unit" ]] && _uninstall_print REMOVE "owned service unit: $unit"
+  [[ -n "$report_unit" ]] && _uninstall_print REMOVE "owned report service unit: $report_unit"
   [[ -n "$tunnel_unit" ]] && _uninstall_print REMOVE "owned tunnel unit: $tunnel_unit"
   [[ -n "$renew_service" ]] && _uninstall_print REMOVE "owned certificate renewal service: $renew_service"
   [[ -n "$renew_timer" ]] && _uninstall_print REMOVE "owned certificate renewal timer: $renew_timer"
@@ -81,6 +84,7 @@ _wait_port_release() {
 _stop_owned_services() {
   local port="${RHMCP_LOCAL_PORT:-${LOCAL_PORT:-8765}}" renew_pid renew_loop
   _disable_owned_systemd_resource cert_renew_timer
+  _disable_owned_systemd_resource report_service_unit
   _disable_owned_systemd_resource tunnel_service_unit
   _disable_owned_systemd_resource service_unit
   renew_pid="$(resource_value portable_cert_renew_pid PATH 2>/dev/null || true)"
@@ -179,6 +183,7 @@ uninstall_apply() {
   _remove_owned_file_resource cert_renew_service
   _remove_owned_file_resource cert_renew_loop
   _remove_owned_file_resource tunnel_service_unit
+  _remove_owned_file_resource report_service_unit
   _remove_owned_file_resource service_unit
   _remove_owned_file_resource nginx_site_link
   _remove_owned_file_resource nginx_site

@@ -66,8 +66,51 @@ EOF2
   if [[ "$AUTHORITY" == user ]]; then chown -R "$SERVICE_USER":"$(id -gn "$SERVICE_USER")" "$STATE_DIR" "$LOG_DIR" "$RUNTIME_DIR"; fi
   systemctl daemon-reload
   systemctl enable --now remote-host-mcp.service
+  install_managed_report_service || true
   SERVICE_BACKEND=systemd
   export SERVICE_BACKEND
+}
+
+install_managed_report_service() {
+  local unit='/etc/systemd/system/remote-host-mcp-report.service' tmp env_file
+  [[ "$INSTALL_MODE" == system && $EUID -eq 0 ]] || return 0
+  systemd_operational || return 0
+  env_file="${CONFIG_DIR}/rhmcp.env"
+  [[ -f "$env_file" ]] || return 0
+  if ! grep -q '^RHMCP_HUB_BASE_URL=' "$env_file" || ! grep -q '^RHMCP_HUB_AGENT_KEY=' "$env_file"; then
+    return 0
+  fi
+  if [[ -e "$unit" ]] && ! managed_file_has_marker "$unit"; then
+    warn "Foreign systemd unit already exists: $unit; skipping report service unit creation."
+    return 0
+  fi
+  tmp="${unit}.tmp.$$"
+  cat > "$tmp" <<EOF2
+# Managed-By: remote-host-mcp
+[Unit]
+Description=Remote Host MCP Audit Reporting Agent (Sidecar)
+After=network-online.target remote-host-mcp.service
+Wants=network-online.target
+PartOf=remote-host-mcp.service
+
+[Service]
+Type=simple
+User=${SERVICE_USER}
+EnvironmentFile=${CONFIG_DIR}/rhmcp.env
+WorkingDirectory=${CURRENT_LINK}
+ExecStart=${CURRENT_LINK}/.venv/bin/remote-host-mcp-report
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target
+EOF2
+  chmod 644 "$tmp"
+  mv -f "$tmp" "$unit"
+  record_resource report_service_unit "$unit" created
+  systemctl daemon-reload
+  systemctl enable --now remote-host-mcp-report.service || true
 }
 
 start_portable_service_managed() {

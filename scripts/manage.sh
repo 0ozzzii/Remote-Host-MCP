@@ -90,6 +90,14 @@ server_bin() {
   fi
 }
 
+report_bin() {
+  if [[ -x .venv/bin/remote-host-mcp-report ]]; then
+    printf '%s\n' "$ROOT/.venv/bin/remote-host-mcp-report"
+  else
+    return 1
+  fi
+}
+
 cmd="${1:-help}"
 case "$cmd" in
   install)
@@ -127,10 +135,14 @@ case "$cmd" in
     sleep 1
     pid_identity_alive logs/server.pid "$server_exec" || { tail -80 logs/server.log >&2 || true; exit 1; }
     echo "server started: PID $(cat logs/server.pid)"
+    if [[ -n "${RHMCP_HUB_BASE_URL:-}" && -n "${RHMCP_HUB_AGENT_KEY:-}" ]]; then
+      bash "$0" report-start || true
+    fi
     ;;
   stop)
     server_exec="$(server_bin 2>/dev/null || printf '%s' "$ROOT/.venv/bin/remote-host-mcp")"
     stop_pidfile logs/server.pid server "$server_exec"
+    bash "$0" report-stop >/dev/null 2>&1 || true
     ;;
   restart)
     bash "$0" stop >/dev/null
@@ -173,6 +185,43 @@ case "$cmd" in
     bash "$0" tunnel-stop >/dev/null
     bash "$0" tunnel-start
     ;;
+  report-start)
+    load_required_env
+    if [[ -z "${RHMCP_HUB_BASE_URL:-}" || -z "${RHMCP_HUB_AGENT_KEY:-}" ]]; then
+      echo 'RHMCP_HUB_BASE_URL or RHMCP_HUB_AGENT_KEY not configured; report agent skipped.'
+      exit 0
+    fi
+    report_exec="$(report_bin 2>/dev/null || true)"
+    [[ -n "$report_exec" ]] || die 'remote-host-mcp-report entrypoint not found.'
+    if pid_identity_alive logs/report.pid "$report_exec"; then
+      echo "report agent already running: PID $(cat logs/report.pid)"
+      exit 0
+    fi
+    if [[ -f logs/report.pid ]]; then
+      stale_pid="$(cat logs/report.pid 2>/dev/null || true)"
+      if [[ "$stale_pid" =~ ^[0-9]+$ ]] && kill -0 "$stale_pid" 2>/dev/null; then
+        die "Refusing to start a second report agent: logs/report.pid points to live PID $stale_pid with mismatched identity."
+      fi
+      clear_pid_identity logs/report.pid
+    fi
+    nohup "$report_exec" >> logs/report.log 2>&1 &
+    report_pid=$!
+    write_pid_identity logs/report.pid "$report_pid" || {
+      kill "$report_pid" 2>/dev/null || true
+      die 'Could not record report agent PID identity.'
+    }
+    sleep 1
+    pid_identity_alive logs/report.pid "$report_exec" || { tail -80 logs/report.log >&2 || true; exit 1; }
+    echo "report agent started: PID $(cat logs/report.pid)"
+    ;;
+  report-stop)
+    report_exec="$(report_bin 2>/dev/null || printf '%s' "$ROOT/.venv/bin/remote-host-mcp-report")"
+    stop_pidfile logs/report.pid "report agent" "$report_exec"
+    ;;
+  report-restart)
+    bash "$0" report-stop >/dev/null 2>&1 || true
+    bash "$0" report-start
+    ;;
   check)
     load_required_env
     port="$(mcp_env_value PORT 2>/dev/null || printf '8765')"
@@ -201,6 +250,14 @@ case "$cmd" in
     else
       echo 'tunnel: DOWN or stale pidfile'
     fi
+    if [[ -n "${RHMCP_HUB_BASE_URL:-}" ]]; then
+      report_exec="$(report_bin 2>/dev/null || printf '%s' "$ROOT/.venv/bin/remote-host-mcp-report")"
+      if pid_identity_alive logs/report.pid "$report_exec"; then
+        echo "report-agent: UP pid=$(cat logs/report.pid)"
+      else
+        echo 'report-agent: DOWN or stale pidfile'
+      fi
+    fi
     printf 'hostname: %s\n' "$(mcp_env_value PUBLIC_HOST 2>/dev/null || printf 'not-configured')"
     ;;
   logs)
@@ -209,7 +266,10 @@ case "$cmd" in
   tunnel-logs)
     tail -n "${2:-100}" logs/tunnel.log 2>/dev/null || true
     ;;
+  report-logs)
+    tail -n "${2:-100}" logs/report.log 2>/dev/null || true
+    ;;
   *)
-    echo "Usage: $0 {install|start|stop|restart|tunnel-start|tunnel-stop|tunnel-restart|check|status|logs|tunnel-logs}"
+    echo "Usage: $0 {install|start|stop|restart|tunnel-start|tunnel-stop|tunnel-restart|report-start|report-stop|report-restart|check|status|logs|tunnel-logs|report-logs}"
     ;;
 esac

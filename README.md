@@ -145,7 +145,7 @@ OSC 133 用于识别正常命令完成；必要时结合 foreground process-grou
 
 ## 3. 安装方式
 
-安装器本身是**中英双语交互式 Linux installer**。首次进入可选择简体中文或 English，安装后也可以通过 `rmcp` 修改界面语言。
+安装器本身是**中英双语交互式 Linux installer**，并带一个全彩管理面板。无参数运行时先进入面板（默认中文），选择安装后再选择简体中文或 English；安装后也可以通过 `rmcp` 修改界面语言。
 
 ### 3.1 从已检出的仓库安装
 
@@ -177,6 +177,14 @@ RHMCP_INSTALL_REF=<tag-or-commit> \
 ```
 
 bootstrap 需要 `curl` 与 `tar`。项目 Python package 要求 Python **>= 3.10**。
+
+> 若希望看到**交互式管理面板**（安装 / Tunnel / 状态 / 服务 / 诊断 / 卸载），请使用进程替换形式：
+>
+> ```bash
+> bash <(curl -fsSL https://raw.githubusercontent.com/0ozzzii/Remote-Host-MCP/main/install.sh)
+> ```
+>
+> 它保留 TTY，面板才会出现。`curl ... | bash` 的 stdin 是管道，面板会被**安全跳过**并直接进入标准安装流程 —— 两种方式对自动化都完全兼容。
 
 ### 3.3 安装器会配置什么
 
@@ -514,6 +522,31 @@ deployments/docker/
 - **ModelScope DSW**：以 `/mnt/workspace` 为持久真源，适合 side-by-side / blue-green 风格切换；
 - **Docker / container**：默认以容器 namespace 为 host boundary，除非显式暴露宿主机 mount / namespace。
 
+### 7.1 三模态分发架构
+
+上面三个 profile 回答的是"**怎么装**"。按节点能力，本仓库还提供三档**模态**，按硬件条件共存、不互相取代：
+
+| 模态 | 适用节点 | 内存门槛 | 依赖 | 能力面 |
+|---|---|---|---|---|
+| **Tier 1 · 全能直连** | VPS / 云主机 / DSW | ≥ 512 MB | Python ≥ 3.10 + venv | 完整 **65** 个 MCP 工具 + 交互式管理面板 |
+| **Tier 2 · 胖中枢 + 瘦代理** | 小内存小鸡、无公网 IP 的节点 | 64 ~ 256 MB | Python ≥ 3.10 | 出站纳管 + 审计上报（**不含**指令下行） |
+| **Tier 3 · 受限沙盒微内核** | 只有 Node.js 的容器（翼龙 / Katabump 类） | ~300 MB | **仅 Node.js**，零 npm 依赖 | **5** 个高频工具，单文件 |
+
+#### 一行极速安装（Tier 1）
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/0ozzzii/Remote-Host-MCP/main/install.sh)
+```
+
+不带任何参数运行会先进入**全彩交互式管理面板**（安装 / Tunnel / 状态 / 服务 / 诊断 / 卸载）；
+带参数（如 `--non-interactive`、`--repair`）或在非交互终端中运行时**完全跳过面板**，
+行为与既有自动化 100% 一致。
+
+#### 其余模态的入口
+
+- **Tier 2** 对接规范（`RHMCP_HUB_*` 契约、三端点、指令下行设计提案）：[`docs/architecture/tier2-hub-agent.md`](docs/architecture/tier2-hub-agent.md)
+- **Tier 3** 微内核与保姆级部署教程：[`deployments/sandbox-node/README.md`](deployments/sandbox-node/README.md)
+
 ---
 
 ## 8. 当前 alpha4 的设计方向
@@ -686,7 +719,7 @@ Service control uses validated `systemctl` argv without shell expansion. If no o
 
 ## 3. Installation
 
-The installer is a **bilingual interactive Linux installer**. The first screen selects Simplified Chinese or English, and the language can later be changed from `rmcp`.
+The installer is a **bilingual interactive Linux installer** with a full-colour management panel. With no arguments it opens the panel first (Chinese by default); after choosing to install you then pick Simplified Chinese or English, and the language can later be changed from `rmcp`.
 
 ### 3.1 Install from a checked-out repository
 
@@ -716,6 +749,14 @@ RHMCP_INSTALL_REF=<tag-or-commit> \
 ```
 
 The bootstrap requires `curl` and `tar`. The Python package requires **Python >= 3.10**.
+
+> To see the **interactive management panel** (install / tunnel / status / service / diagnose / uninstall), use process substitution:
+>
+> ```bash
+> bash <(curl -fsSL https://raw.githubusercontent.com/0ozzzii/Remote-Host-MCP/main/install.sh)
+> ```
+>
+> It preserves the TTY, which is what makes the panel appear. With `curl ... | bash` stdin is a pipe, so the panel is **skipped safely** and the standard install flow runs. Both forms are fully compatible with automation.
 
 ### 3.3 What the installer configures
 
@@ -932,6 +973,29 @@ deployments/docker/
 - **Generic Linux** — VPS, VM, workstation.
 - **ModelScope DSW** — `/mnt/workspace` persistence and side-by-side/blue-green style cutover.
 - **Docker/container** — the container namespace is the host boundary unless host mounts/namespaces are explicitly exposed.
+
+### 7.1 Three-tier distribution
+
+The profiles above answer "**how to install**". The repository additionally ships three **tiers** keyed to node capability; they coexist rather than replace each other:
+
+| Tier | Target node | Memory floor | Dependency | Surface |
+|---|---|---|---|---|
+| **Tier 1 · Full direct** | VPS / VM / DSW | ≥ 512 MB | Python ≥ 3.10 + venv | All **65** MCP tools + interactive management panel |
+| **Tier 2 · Fat hub + thin agent** | Small hosts, no public IP | 64 ~ 256 MB | Python ≥ 3.10 | Outbound enrolment + audit reporting (**no** command downlink) |
+| **Tier 3 · Restricted sandbox micro-kernel** | Node-only containers (Pterodactyl / Katabump class) | ~300 MB | **Node.js only**, zero npm | **5** high-frequency tools, single file |
+
+#### One-line install (Tier 1)
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/0ozzzii/Remote-Host-MCP/main/install.sh)
+```
+
+Run with no arguments, it first opens a **full-colour interactive management panel** (install / tunnel / status / service / diagnose / uninstall). Run with an argument (such as `--non-interactive` or `--repair`), or on a non-interactive terminal, the panel is **skipped entirely** and behaviour is byte-identical to the existing automation.
+
+#### Entry points for the other tiers
+
+- **Tier 2** contract and design notes (`RHMCP_HUB_*`, three endpoints, command-downlink proposal): [`docs/architecture/tier2-hub-agent.md`](docs/architecture/tier2-hub-agent.md)
+- **Tier 3** micro-kernel and step-by-step deployment guide: [`deployments/sandbox-node/README.md`](deployments/sandbox-node/README.md)
 
 ---
 

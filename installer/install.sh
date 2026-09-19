@@ -18,6 +18,7 @@ source "$SELF_DIR/lib/reverse_proxy.sh"
 source "$SELF_DIR/lib/tls.sh"
 source "$SELF_DIR/lib/port_hardening.sh"
 source "$SELF_DIR/lib/uninstall.sh"
+source "$SELF_DIR/lib/menu.sh"
 
 RMCP_VERSION="$(tr -d '\r\n' < "$SOURCE_ROOT/VERSION")"
 ACTION='install'
@@ -52,6 +53,10 @@ LOCAL_VALIDATED=false
 RHMCP_NON_INTERACTIVE="${RHMCP_NON_INTERACTIVE:-0}"
 
 parse_args() {
+  # Any explicit argument means an automated caller (CI, remote panel, rmcp
+  # launcher): the interactive start menu must never appear.
+  if (($#)); then RHMCP_MENU_DISABLED=1; fi
+  export RHMCP_MENU_DISABLED
   while (($#)); do
     case "$1" in
       --resume) ACTION=resume ;;
@@ -636,6 +641,7 @@ main() {
   parse_args "$@"
   prime_state_context
   if [[ "$ACTION" == repair || "$ACTION" == diagnose ]]; then run_repair_or_diagnose_from_state || true; fi
+  maybe_show_start_menu
   select_language
   header "$(t title) $RMCP_VERSION"
   preflight

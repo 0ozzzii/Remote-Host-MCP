@@ -419,6 +419,46 @@ copy_release() {
 
 install_runtime() {
   if [[ -x "$RELEASE_DIR/.venv/bin/remote-host-mcp" ]]; then ok 'Existing staged runtime is complete; reusing it.'; return 0; fi
+
+  # Fast-Path: 优先使用预构建独立运行时（免编译、免 pip、零构建秒装）
+  if [[ "${RHMCP_BUILD_FROM_SOURCE:-0}" != 1 ]]; then
+    local target_arch="$(uname -m 2>/dev/null || echo 'x86_64')"
+    local prebuilt_archive="${RHMCP_PREBUILT_ARCHIVE:-}"
+    local prebuilt_url="${RHMCP_PREBUILT_URL:-}"
+    local tmp_archive="/tmp/rhmcp-runtime-$$.tar.gz"
+
+    # 1. 检查本地离线归档
+    if [[ -n "$prebuilt_archive" && -r "$prebuilt_archive" ]]; then
+      info "Extracting local prebuilt runtime / 正在释放本地预构建运行时: $prebuilt_archive"
+      rm -rf -- "$RELEASE_DIR/.venv"
+      mkdir -p "$RELEASE_DIR/.venv"
+      if tar -xzf "$prebuilt_archive" -C "$RELEASE_DIR/.venv" 2>/dev/null && [[ -x "$RELEASE_DIR/.venv/bin/remote-host-mcp" ]]; then
+        ok 'Prebuilt runtime installed from local archive! (Zero build time)'
+        return 0
+      fi
+    fi
+
+    # 2. 检查网络预构建归档
+    if [[ -z "$prebuilt_url" ]]; then
+      local ver="${RHMCP_VERSION:-0.2.0a4}"
+      prebuilt_url="https://github.com/0ozzzii/Remote-Host-MCP/releases/download/v${ver}/rhmcp-runtime-linux-${target_arch}.tar.gz"
+    fi
+
+    info "Attempting zero-build prebuilt runtime install / 正在尝试预构建免编译秒装: $prebuilt_url"
+    if curl -fsSL --connect-timeout 8 --max-time 60 "$prebuilt_url" -o "$tmp_archive" 2>/dev/null; then
+      info 'Prebuilt runtime downloaded successfully; extracting... / 预构建包下载成功，正在流式解包...'
+      rm -rf -- "$RELEASE_DIR/.venv"
+      mkdir -p "$RELEASE_DIR/.venv"
+      if tar -xzf "$tmp_archive" -C "$RELEASE_DIR/.venv" 2>/dev/null && [[ -x "$RELEASE_DIR/.venv/bin/remote-host-mcp" ]]; then
+        ok 'Prebuilt runtime installed and verified! (Zero build time) / 预构建运行时就绪，0 构建秒级安装完成！'
+        rm -f "$tmp_archive"
+        return 0
+      fi
+      rm -f "$tmp_archive"
+    fi
+    warn 'Prebuilt runtime unavailable or network restricted; falling back to local build. / 预构建包不可达，自动降级至本地构建。'
+  fi
+
   rm -rf -- "$RELEASE_DIR/.venv"
   info 'Creating Python virtual environment / 创建 Python 虚拟环境'
   python3 -m venv "$RELEASE_DIR/.venv"

@@ -58,36 +58,27 @@ mkdir -p runtime-root
 tar -xzf "${PYTHON_ARTIFACT}" -C runtime-root
 
 # python-build-standalone 解压出 python/ 目录
-PYTHON_BIN="$(pwd)/runtime-root/python/bin/python3"
+PYTHON_ROOT="$(pwd)/runtime-root/python"
+PYTHON_BIN="$PYTHON_ROOT/bin/python3"
 chmod +x "$PYTHON_BIN"
 
-echo "--> 正在初始化独立虚拟环境与装载依赖..."
-# 使用该独立 python 创建 .venv
-"$PYTHON_BIN" -m venv --copies venv-env
-
-VENV_DIR="$(pwd)/venv-env"
-"$VENV_DIR/bin/python" -m pip install --no-cache-dir --upgrade pip
-
-echo "--> 正在安装 Remote-Host-MCP 与全部运行时依赖..."
-"$VENV_DIR/bin/pip" install --no-cache-dir "${REPO_ROOT}"
+echo "--> 正在安装 Remote-Host-MCP 与全部运行时依赖到原生独立 Python 树..."
+"$PYTHON_BIN" -m pip install --no-cache-dir --upgrade pip
+"$PYTHON_BIN" -m pip install --no-cache-dir "${REPO_ROOT}"
 
 echo "--> 正在执行便携化（Relocatable）后处理..."
-# 1. 将 .venv 内部脚本的 shebang 改为动态解析的便携模式
-# 在 Linux 下使用 #!/usr/bin/env bash 或查找相对路径 python
-find "$VENV_DIR/bin" -type f -executable | while read -r file; do
+# 1. 将 bin 内部入口脚本的 shebang 改为相对目录便携引用
+find "$PYTHON_ROOT/bin" -type f -executable | while read -r file; do
   if head -n 1 "$file" | grep -q "^#\!.*python"; then
-    # 替换为便携包装器
     cat << 'WRAPPER_EOF' > "${file}.tmp"
 #!/usr/bin/env bash
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-PYTHON_EXEC="$VENV_ROOT/bin/python"
+PYTHON_EXEC="$SCRIPT_DIR/python3"
 if [ ! -x "$PYTHON_EXEC" ]; then
   PYTHON_EXEC="$(command -v python3 || true)"
 fi
 exec "$PYTHON_EXEC" "$0" "$@"
 WRAPPER_EOF
-    # 保留原 python 脚本内容（去掉第一行硬编码 shebang）
     sed '1d' "$file" >> "${file}.tmp"
     mv "${file}.tmp" "$file"
     chmod +x "$file"
@@ -96,14 +87,13 @@ done
 
 # 验证 entrypoint 可用性
 echo "--> 校验 entrypoint 是否就绪..."
-"$VENV_DIR/bin/remote-host-mcp" --help >/dev/null 2>&1 || true
+"$PYTHON_ROOT/bin/remote-host-mcp" --help >/dev/null 2>&1 || true
 
-# 2. 打包生成便携式 tarball
+# 2. 打包生成便携式 tarball（直接打包原生独立 python 树，包含全部标准库与 site-packages）
 ARCHIVE_NAME="rhmcp-runtime-linux-${TARGET_ARCH}.tar.gz"
-echo "--> 正在压缩便携运行时: ${DIST_DIR}/${ARCHIVE_NAME}"
+echo "--> 正在压缩独立绿色便携运行时: ${DIST_DIR}/${ARCHIVE_NAME}"
 
-# 打包时以相对路径打包整个 venv-env 目录内容
-tar -czf "${DIST_DIR}/${ARCHIVE_NAME}" -C "$VENV_DIR" .
+tar -czf "${DIST_DIR}/${ARCHIVE_NAME}" -C "$PYTHON_ROOT" .
 
 cd "${DIST_DIR}"
 if command -v sha256sum >/dev/null 2>&1; then
